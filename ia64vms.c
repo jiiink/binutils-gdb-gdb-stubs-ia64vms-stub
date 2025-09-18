@@ -295,14 +295,14 @@ term_raw_write (const char *str, unsigned int len)
   unsigned short status;
   struct _iosb iosb;
 
-  status = sys$qiow (EFN$C_ENF,
-		     term_chan,
-		     IO$_WRITEVBLK,
-		     &iosb,
-		     0,
-		     0,
-		     (char *)str,
-		     len,
+  status = sys$qiow (EFN$C_ENF,           /* Event flag.  */
+		     term_chan,           /* I/O channel.  */
+		     IO$_WRITEVBLK,       /* I/O function code.  */
+		     &iosb,               /* I/O status block.  */
+		     0,                   /* Ast service routine.  */
+		     0,                   /* Ast parameter.  */
+		     (char *)str,         /* P1 - buffer address.  */
+		     len,                 /* P2 - buffer length.  */
 		     0, 0, 0, 0);
 
   if (status & STS$M_SUCCESS)
@@ -313,15 +313,14 @@ term_raw_write (const char *str, unsigned int len)
 
 /* Flush the term buffer.  */
 
-static void term_flush(void)
+static void
+term_flush (void)
 {
-    if (term_buf_len == 0)
+  if (term_buf_len != 0)
     {
-        return;
+      term_raw_write (term_buf, term_buf_len);
+      term_buf_len = 0;
     }
-    
-    term_raw_write(term_buf, term_buf_len);
-    term_buf_len = 0;
 }
 
 /* Write a single character, without translation.  */
@@ -336,411 +335,379 @@ term_raw_putchar (char c)
 
 /* Write character C.  Translate '\n' to '\n\r'.  */
 
-static void handle_control_character(char *c)
+static void
+term_putc (char c)
 {
-    if (*c != '\r' && *c != '\n')
-        *c = '.';
-}
-
-static void handle_newline(void)
-{
-    term_raw_putchar('\r');
-    term_flush();
-}
-
-static void term_putc(char c)
-{
-    if (c < 32)
-        handle_control_character(&c);
-    
-    term_raw_putchar(c);
-    
-    if (c == '\n')
-        handle_newline();
+  if (c < 32)
+    switch (c)
+      {
+      case '\r':
+      case '\n':
+	break;
+      default:
+	c = '.';
+	break;
+      }
+  term_raw_putchar (c);
+  if (c == '\n')
+    {
+      term_raw_putchar ('\r');
+      term_flush ();
+    }
 }
 
 /* Write a C string.  */
 
-static void term_puts(const char *str)
+static void
+term_puts (const char *str)
 {
-    while (*str)
-    {
-        term_putc(*str++);
-    }
+  while (*str)
+    term_putc (*str++);
 }
 
 /* Write LEN bytes from STR.  */
 
 static void
-term_write(const char *str, unsigned int len)
+term_write (const char *str, unsigned int len)
 {
-    const char *end = str + len;
-    while (str < end) {
-        term_putc(*str++);
-    }
+  for (; len > 0; len--)
+    term_putc (*str++);
 }
 
 /* Write using FAO formatting.  */
 
-static void process_fao_buffer(const char *buf, unsigned short length)
+static void
+term_fao (const char *str, unsigned int str_len, ...)
 {
-    for (int i = 0; i < length; i++)
-    {
-        term_raw_putchar(buf[i]);
-        if (buf[i] == '\n')
-            term_flush();
-    }
-}
-
-static __int64* extract_fao_arguments(va_list vargs, int count)
-{
-    __int64 *args = (__int64 *) __ALLOCA(count * sizeof(__int64));
-    int arg_count = count - 2;
-    
-    for (int i = 0; i < arg_count; i++)
-        args[i] = va_arg(vargs, __int64);
-    
-    return args;
-}
-
-static void term_fao(const char *str, unsigned int str_len, ...)
-{
-    va_list vargs;
-    int cnt;
-    char buf[128];
-    $DESCRIPTOR(buf_desc, buf);
-    struct dsc$descriptor_s dstr =
+  int cnt;
+  va_list vargs;
+  int i;
+  __int64 *args;
+  int status;
+  struct dsc$descriptor_s dstr =
     { str_len, DSC$K_DTYPE_T, DSC$K_CLASS_S, (__char_ptr32)str };
+  char buf[128];
+  $DESCRIPTOR (buf_desc, buf);
 
-    va_start(vargs, str_len);
-    va_count(cnt);
-    
-    __int64 *args = extract_fao_arguments(vargs, cnt);
-    
-    int status = sys$faol_64(&dstr, &buf_desc.dsc$w_length, &buf_desc, args);
-    if (status & 1)
-        process_fao_buffer(buf, buf_desc.dsc$w_length);
-    
-    va_end(vargs);
+  va_start (vargs, str_len);
+  va_count (cnt);
+  args = (__int64 *) __ALLOCA (cnt * sizeof (__int64));
+  cnt -= 2;
+  for (i = 0; i < cnt; i++)
+    args[i] = va_arg (vargs, __int64);
+
+  status = sys$faol_64 (&dstr, &buf_desc.dsc$w_length, &buf_desc, args);
+  if (status & 1)
+    {
+      /* FAO !/ already insert a line feed.  */
+      for (i = 0; i < buf_desc.dsc$w_length; i++)
+	{
+	  term_raw_putchar (buf[i]);
+	  if (buf[i] == '\n')
+	    term_flush ();
+	}
+    }
+      
+  va_end (vargs);
 }
 
 #define TERM_FAO(STR, ...) term_fao (STR, sizeof (STR) - 1, __VA_ARGS__)
 
 /* New line.  */
 
-static void term_putnl(void)
+static void
+term_putnl (void)
 {
-    term_putc('\n');
+  term_putc ('\n');
 }
 
 /* Initialize terminal.  */
 
-static void initialize_item_list(ILE3 *item_lst, char *resstring, unsigned short *len)
+static void
+term_init (void)
 {
-  item_lst[0].ile3$w_length = LNM$C_NAMLENGTH;
-  item_lst[0].ile3$w_code = LNM$_STRING;
-  item_lst[0].ile3$ps_bufaddr = resstring;
-  item_lst[0].ile3$ps_retlen_addr = len;
-  item_lst[1].ile3$w_length = 0;
-  item_lst[1].ile3$w_code = 0;
-}
-
-static void translate_logical_name(ILE3 *item_lst)
-{
-  static const $DESCRIPTOR (tabdesc, "LNM$FILE_DEV");
-  static const $DESCRIPTOR (logdesc, "SYS$OUTPUT");
-  
-  unsigned int status = SYS$TRNLNM (0,
-                                     (void *) &tabdesc,
-                                     (void *) &logdesc,
-                                     0,
-                                     item_lst);
-  if (!(status & STS$M_SUCCESS))
-    LIB$SIGNAL (status);
-}
-
-static void adjust_descriptor_for_escape_sequence($DESCRIPTOR *desc, char *resstring)
-{
-  const unsigned int ESCAPE_SEQUENCE_LENGTH = 4;
-  const char ESCAPE_CHAR = 0x1B;
-  
-  if (resstring[0] == ESCAPE_CHAR)
-    {
-      desc->dsc$w_length -= ESCAPE_SEQUENCE_LENGTH;
-      desc->dsc$a_pointer += ESCAPE_SEQUENCE_LENGTH;
-    }
-}
-
-static void assign_channel($DESCRIPTOR *desc)
-{
-  unsigned int status = sys$assign (desc,
-                                     &term_chan,
-                                     0,
-                                     0);
-  if (!(status & STS$M_SUCCESS))
-    LIB$SIGNAL (status);
-}
-
-static void term_init (void)
-{
+  unsigned int status,i;
   unsigned short len;
   char resstring[LNM$C_NAMLENGTH];
+  static const $DESCRIPTOR (tabdesc, "LNM$FILE_DEV");
+  static const $DESCRIPTOR (logdesc, "SYS$OUTPUT");
   $DESCRIPTOR (term_desc, resstring);
   ILE3 item_lst[2];
 
-  initialize_item_list(item_lst, resstring, &len);
-  translate_logical_name(item_lst);
-  
+  item_lst[0].ile3$w_length = LNM$C_NAMLENGTH;
+  item_lst[0].ile3$w_code = LNM$_STRING;
+  item_lst[0].ile3$ps_bufaddr = resstring;
+  item_lst[0].ile3$ps_retlen_addr = &len;
+  item_lst[1].ile3$w_length = 0;
+  item_lst[1].ile3$w_code = 0;
+
+  /* Translate the logical name.  */
+  status = SYS$TRNLNM (0,          	  /* Attr of the logical name.  */
+		       (void *) &tabdesc, /* Logical name table.  */
+		       (void *) &logdesc, /* Logical name.  */
+		       0,          /* Access mode.  */
+		       item_lst);  /* Item list.  */
+  if (!(status & STS$M_SUCCESS))
+    LIB$SIGNAL (status);
+
   term_desc.dsc$w_length = len;
-  adjust_descriptor_for_escape_sequence(&term_desc, resstring);
-  assign_channel(&term_desc);
+
+  /* Examine 4-byte header.  Skip escape sequence.  */
+  if (resstring[0] == 0x1B)
+    {
+      term_desc.dsc$w_length -= 4;
+      term_desc.dsc$a_pointer += 4;
+    }
+
+  /* Assign a channel.  */
+  status = sys$assign (&term_desc,   /* Device name.  */
+		       &term_chan,   /* I/O channel.  */
+		       0,            /* Access mode.  */
+		       0);
+  if (!(status & STS$M_SUCCESS))
+    LIB$SIGNAL (status);
 }
 
 /* Convert from native endianness to network endianness (and vice-versa).  */
 
 static unsigned int
-wordswap(unsigned int v)
+wordswap (unsigned int v)
 {
-    #define BYTE_MASK 0xff
-    #define BYTE_SHIFT 8
-    
-    return ((v & BYTE_MASK) << BYTE_SHIFT) | ((v >> BYTE_SHIFT) & BYTE_MASK);
+  return ((v & 0xff) << 8) | ((v >> 8) & 0xff);
 }
 
 /* Initialize the socket connection, and wait for a client.  */
 
-static void handle_socket_error(const char *message, unsigned int status)
-{
-    term_puts(message);
-    LIB$SIGNAL(status);
-}
-
-static unsigned int assign_io_channels(unsigned short *listen_channel)
-{
-    static const $DESCRIPTOR(inet_device, "TCPIP$DEVICE:");
-    unsigned int status;
-    
-    status = sys$assign((void *)&inet_device, listen_channel, 0, 0);
-    if (status & STS$M_SUCCESS)
-        status = sys$assign((void *)&inet_device, &conn_channel, 0, 0);
-    
-    return status;
-}
-
-static unsigned int create_listen_socket(unsigned short listen_channel)
-{
-    struct _iosb iosb;
-    unsigned int status;
-    struct sockchar listen_sockchar;
-    
-    listen_sockchar.prot = TCPIP$C_TCP;
-    listen_sockchar.type = TCPIP$C_STREAM;
-    listen_sockchar.af = TCPIP$C_AF_INET;
-    
-    status = sys$qiow(EFN$C_ENF, listen_channel, IO$_SETMODE, &iosb,
-                      0, 0, &listen_sockchar, 0, 0, 0, 0, 0);
-    if (status & STS$M_SUCCESS)
-        status = iosb.iosb$w_status;
-    
-    return status;
-}
-
-static unsigned int set_reuseaddr_option(unsigned short listen_channel)
-{
-    struct _iosb iosb;
-    unsigned int status;
-    int optval = 1;
-    ILE2 sockopt_itemlst;
-    ILE2 reuseaddr_itemlst;
-    
-    reuseaddr_itemlst.ile2$w_length = sizeof(optval);
-    reuseaddr_itemlst.ile2$w_code = TCPIP$C_REUSEADDR;
-    reuseaddr_itemlst.ile2$ps_bufaddr = &optval;
-    
-    sockopt_itemlst.ile2$w_length = sizeof(reuseaddr_itemlst);
-    sockopt_itemlst.ile2$w_code = TCPIP$C_SOCKOPT;
-    sockopt_itemlst.ile2$ps_bufaddr = &reuseaddr_itemlst;
-    
-    status = sys$qiow(EFN$C_ENF, listen_channel, IO$_SETMODE, &iosb,
-                      0, 0, 0, 0, 0, 0, (__int64)&sockopt_itemlst, 0);
-    if (status & STS$M_SUCCESS)
-        status = iosb.iosb$w_status;
-    
-    return status;
-}
-
-static unsigned int bind_server_socket(unsigned short listen_channel, struct sockaddr_in *serv_addr)
-{
-    struct _iosb iosb;
-    unsigned int status;
-    ILE2 serv_itemlst;
-    
-    ots$fill(serv_addr, sizeof(*serv_addr), 0);
-    serv_addr->sin_family = TCPIP$C_AF_INET;
-    serv_addr->sin_port = wordswap(serv_port);
-    serv_addr->sin_addr.s_addr = TCPIP$C_INADDR_ANY;
-    
-    serv_itemlst.ile2$w_length = sizeof(*serv_addr);
-    serv_itemlst.ile2$w_code = TCPIP$C_SOCK_NAME;
-    serv_itemlst.ile2$ps_bufaddr = serv_addr;
-    
-    status = sys$qiow(EFN$C_ENF, listen_channel, IO$_SETMODE, &iosb,
-                      0, 0, 0, 0, (__int64)&serv_itemlst, 0, 0, 0);
-    if (status & STS$M_SUCCESS)
-        status = iosb.iosb$w_status;
-    
-    return status;
-}
-
-static unsigned int set_socket_passive(unsigned short listen_channel)
-{
-    struct _iosb iosb;
-    unsigned int status;
-    
-    status = sys$qiow(EFN$C_ENF, listen_channel, IO$_SETMODE, &iosb,
-                      0, 0, 0, 0, 0, 1, 0, 0);
-    if (status & STS$M_SUCCESS)
-        status = iosb.iosb$w_status;
-    
-    return status;
-}
-
-static unsigned int accept_client_connection(unsigned short listen_channel, struct sockaddr_in *serv_addr)
-{
-    struct _iosb iosb;
-    unsigned int status;
-    
-    TERM_FAO("Waiting for a client connection on port: !ZW!/",
-             wordswap(serv_addr->sin_port));
-    
-    status = sys$qiow(EFN$C_ENF, listen_channel, IO$_ACCESS|IO$M_ACCEPT, &iosb,
-                      0, 0, 0, 0, 0, (__int64)&conn_channel, 0, 0);
-    
-    if (status & STS$M_SUCCESS)
-        status = iosb.iosb$w_status;
-    
-    return status;
-}
-
-static unsigned int get_client_info(struct sockaddr_in *cli_addr, unsigned short *cli_addrlen)
-{
-    struct _iosb iosb;
-    unsigned int status;
-    ILE3 cli_itemlst;
-    
-    cli_itemlst.ile3$w_length = sizeof(*cli_addr);
-    cli_itemlst.ile3$w_code = TCPIP$C_SOCK_NAME;
-    cli_itemlst.ile3$ps_bufaddr = cli_addr;
-    cli_itemlst.ile3$ps_retlen_addr = cli_addrlen;
-    
-    ots$fill(cli_addr, sizeof(*cli_addr), 0);
-    
-    status = sys$qiow(EFN$C_ENF, conn_channel, IO$_SENSEMODE, &iosb,
-                      0, 0, 0, 0, 0, (__int64)&cli_itemlst, 0, 0);
-    if (status & STS$M_SUCCESS)
-        status = iosb.iosb$w_status;
-    
-    return status;
-}
-
-#define IP_BYTE_MASK 0xff
-#define BYTE_SHIFT_8 8
-#define BYTE_SHIFT_16 16
-#define BYTE_SHIFT_24 24
-
-static void log_client_connection(struct sockaddr_in *cli_addr)
-{
-    TERM_FAO("Accepted connection from host: !UB.!UB,!UB.!UB, port: !UW!/",
-             (cli_addr->sin_addr.s_addr >> 0) & IP_BYTE_MASK,
-             (cli_addr->sin_addr.s_addr >> BYTE_SHIFT_8) & IP_BYTE_MASK,
-             (cli_addr->sin_addr.s_addr >> BYTE_SHIFT_16) & IP_BYTE_MASK,
-             (cli_addr->sin_addr.s_addr >> BYTE_SHIFT_24) & IP_BYTE_MASK,
-             wordswap(cli_addr->sin_port));
-}
-
-static void sock_init(void)
-{
-    unsigned int status;
-    unsigned short listen_channel;
-    struct sockaddr_in serv_addr;
-    struct sockaddr_in cli_addr;
-    unsigned short cli_addrlen;
-    
-    status = assign_io_channels(&listen_channel);
-    if (!(status & STS$M_SUCCESS))
-        handle_socket_error("Failed to assign I/O channel(s)\n", status);
-    
-    status = create_listen_socket(listen_channel);
-    if (!(status & STS$M_SUCCESS))
-        handle_socket_error("Failed to create socket\n", status);
-    
-    status = set_reuseaddr_option(listen_channel);
-    if (!(status & STS$M_SUCCESS))
-        handle_socket_error("Failed to set socket option\n", status);
-    
-    status = bind_server_socket(listen_channel, &serv_addr);
-    if (!(status & STS$M_SUCCESS))
-        handle_socket_error("Failed to bind socket\n", status);
-    
-    status = set_socket_passive(listen_channel);
-    if (!(status & STS$M_SUCCESS))
-        handle_socket_error("Failed to set socket passive\n", status);
-    
-    status = accept_client_connection(listen_channel, &serv_addr);
-    if (!(status & STS$M_SUCCESS))
-        handle_socket_error("Failed to accept client connection\n", status);
-    
-    status = get_client_info(&cli_addr, &cli_addrlen);
-    if (!(status & STS$M_SUCCESS))
-        handle_socket_error("Failed to get client name\n", status);
-    
-    log_client_connection(&cli_addr);
-}
-
-/* Close the socket.  */
-
-static void check_status(unsigned int status, const char* error_message)
-{
-  if (!(status & STS$M_SUCCESS))
-    {
-      term_puts(error_message);
-      LIB$SIGNAL(status);
-    }
-}
-
-static unsigned int close_socket_connection(void)
+static void
+sock_init (void)
 {
   struct _iosb iosb;
   unsigned int status;
 
-  status = sys$qiow(EFN$C_ENF,
-                    conn_channel,
-                    IO$_DEACCESS,
-                    &iosb,
-                    0,
-                    0,
-                    0, 0, 0, 0, 0, 0);
+  /* Listen channel and characteristics.  */
+  unsigned short listen_channel;
+  struct sockchar listen_sockchar;
+
+  /* Client address.  */
+  unsigned short cli_addrlen;
+  struct sockaddr_in cli_addr;
+  ILE3 cli_itemlst;
+
+  /* Our address.  */
+  struct sockaddr_in serv_addr;
+  ILE2 serv_itemlst;
+
+  /* Reuseaddr option value (on).  */
+  int optval = 1;
+  ILE2 sockopt_itemlst;
+  ILE2 reuseaddr_itemlst;
+
+  /* TCP/IP network pseudodevice.  */
+  static const $DESCRIPTOR (inet_device, "TCPIP$DEVICE:");
+
+  /* Initialize socket characteristics.  */
+  listen_sockchar.prot = TCPIP$C_TCP;
+  listen_sockchar.type = TCPIP$C_STREAM;
+  listen_sockchar.af   = TCPIP$C_AF_INET;
+
+  /* Assign I/O channels to network device.  */
+  status = sys$assign ((void *) &inet_device, &listen_channel, 0, 0);
+  if (status & STS$M_SUCCESS)
+    status = sys$assign ((void *) &inet_device, &conn_channel, 0, 0);
+  if (!(status & STS$M_SUCCESS))
+    {
+      term_puts ("Failed to assign I/O channel(s)\n");
+      LIB$SIGNAL (status);
+    }
+
+  /* Create a listen socket.  */
+  status = sys$qiow (EFN$C_ENF,           /* Event flag.  */
+		     listen_channel,      /* I/O channel.  */
+		     IO$_SETMODE,         /* I/O function code.  */
+		     &iosb,               /* I/O status block.  */
+		     0,                   /* Ast service routine.  */
+		     0,                   /* Ast parameter.  */
+		     &listen_sockchar,    /* P1 - socket characteristics.  */
+		     0, 0, 0, 0, 0);
+  if (status & STS$M_SUCCESS)
+    status = iosb.iosb$w_status;
+  if (!(status & STS$M_SUCCESS))
+    {
+      term_puts ("Failed to create socket\n");
+      LIB$SIGNAL (status);
+    }
+
+  /* Set reuse address option.  */
+  /* Initialize reuseaddr's item-list element.  */
+  reuseaddr_itemlst.ile2$w_length   = sizeof (optval);
+  reuseaddr_itemlst.ile2$w_code     = TCPIP$C_REUSEADDR;
+  reuseaddr_itemlst.ile2$ps_bufaddr = &optval;
+
+  /* Initialize setsockopt's item-list descriptor.  */
+  sockopt_itemlst.ile2$w_length   = sizeof (reuseaddr_itemlst);
+  sockopt_itemlst.ile2$w_code     = TCPIP$C_SOCKOPT;
+  sockopt_itemlst.ile2$ps_bufaddr = &reuseaddr_itemlst;
+
+  status = sys$qiow (EFN$C_ENF,       /* Event flag.  */
+		     listen_channel,  /* I/O channel.  */
+		     IO$_SETMODE,     /* I/O function code.  */
+		     &iosb,           /* I/O status block.  */
+		     0,               /* Ast service routine.  */
+		     0,               /* Ast parameter.  */
+		     0,               /* P1.  */
+		     0,               /* P2.  */
+		     0,               /* P3.  */
+		     0,               /* P4.  */
+		     (__int64) &sockopt_itemlst, /* P5 - socket options.  */
+		     0);
+  if (status & STS$M_SUCCESS)
+    status = iosb.iosb$w_status;
+  if (!(status & STS$M_SUCCESS))
+    {
+      term_puts ("Failed to set socket option\n");
+      LIB$SIGNAL (status);
+    }
+
+  /* Bind server's ip address and port number to listen socket.  */
+  /* Initialize server's socket address structure.  */
+  ots$fill (&serv_addr, sizeof (serv_addr), 0);
+  serv_addr.sin_family = TCPIP$C_AF_INET;
+  serv_addr.sin_port = wordswap (serv_port);
+  serv_addr.sin_addr.s_addr = TCPIP$C_INADDR_ANY;
+
+  /* Initialize server's item-list descriptor.  */
+  serv_itemlst.ile2$w_length   = sizeof (serv_addr);
+  serv_itemlst.ile2$w_code     = TCPIP$C_SOCK_NAME;
+  serv_itemlst.ile2$ps_bufaddr = &serv_addr;
+
+  status = sys$qiow (EFN$C_ENF,           /* Event flag.  */
+		     listen_channel,      /* I/O channel.  */
+		     IO$_SETMODE,         /* I/O function code.  */
+		     &iosb,               /* I/O status block.  */
+		     0,                   /* Ast service routine.  */
+		     0,                   /* Ast parameter.  */
+		     0,                   /* P1.  */
+		     0,                   /* P2.  */
+		     (__int64) &serv_itemlst, /* P3 - local socket name.  */
+		     0, 0, 0);
+  if (status & STS$M_SUCCESS)
+    status = iosb.iosb$w_status;
+  if (!(status & STS$M_SUCCESS))
+    {
+      term_puts ("Failed to bind socket\n");
+      LIB$SIGNAL (status);
+    }
+
+  /* Set socket as a listen socket.  */
+  status = sys$qiow (EFN$C_ENF,           /* Event flag.  */
+		     listen_channel,      /* I/O channel.  */
+		     IO$_SETMODE,         /* I/O function code.  */
+		     &iosb,               /* I/O status block.  */
+		     0,                   /* Ast service routine.  */
+		     0,                   /* Ast parameter.  */
+		     0,                   /* P1.  */
+		     0,                   /* P2.  */
+		     0,                   /* P3.  */
+		     1,                   /* P4 - connection backlog.  */
+		     0, 0);
+  if (status & STS$M_SUCCESS)
+    status = iosb.iosb$w_status;
+  if (!(status & STS$M_SUCCESS))
+    {
+      term_puts ("Failed to set socket passive\n");
+      LIB$SIGNAL (status);
+    }
+
+  /* Accept connection from a client.  */
+  TERM_FAO ("Waiting for a client connection on port: !ZW!/",
+	    wordswap (serv_addr.sin_port));
+
+  status = sys$qiow (EFN$C_ENF,              /* Event flag.  */
+		     listen_channel,         /* I/O channel.  */
+		     IO$_ACCESS|IO$M_ACCEPT, /* I/O function code.  */
+		     &iosb,                  /* I/O status block.  */
+		     0,                      /* Ast service routine.  */
+		     0,                      /* Ast parameter.  */
+		     0,                      /* P1.  */
+		     0,                      /* P2.  */
+		     0,                      /* P3.  */
+		     (__int64) &conn_channel, /* P4 - I/O channel for conn.  */
+		     0, 0);
 
   if (status & STS$M_SUCCESS)
     status = iosb.iosb$w_status;
+  if (!(status & STS$M_SUCCESS))
+    {
+      term_puts ("Failed to accept client connection\n");
+      LIB$SIGNAL (status);
+    }
 
-  return status;
+  /* Log client connection request.  */
+  cli_itemlst.ile3$w_length = sizeof (cli_addr);
+  cli_itemlst.ile3$w_code = TCPIP$C_SOCK_NAME;
+  cli_itemlst.ile3$ps_bufaddr = &cli_addr;
+  cli_itemlst.ile3$ps_retlen_addr = &cli_addrlen;
+  ots$fill (&cli_addr, sizeof(cli_addr), 0);
+  status = sys$qiow (EFN$C_ENF,           /* Event flag.  */
+		     conn_channel,        /* I/O channel.  */
+		     IO$_SENSEMODE,       /* I/O function code.  */
+		     &iosb,               /* I/O status block.  */
+		     0,                   /* Ast service routine.  */
+		     0,                   /* Ast parameter.  */
+		     0,                   /* P1.  */
+		     0,                   /* P2.  */
+		     0,                   /* P3.  */
+		     (__int64) &cli_itemlst,  /* P4 - peer socket name.  */
+		     0, 0);
+  if (status & STS$M_SUCCESS)
+    status = iosb.iosb$w_status;
+  if (!(status & STS$M_SUCCESS))
+    {
+      term_puts ("Failed to get client name\n");
+      LIB$SIGNAL (status);
+    }
+
+  TERM_FAO ("Accepted connection from host: !UB.!UB,!UB.!UB, port: !UW!/",
+	    (cli_addr.sin_addr.s_addr >> 0) & 0xff,
+	    (cli_addr.sin_addr.s_addr >> 8) & 0xff,
+	    (cli_addr.sin_addr.s_addr >> 16) & 0xff,
+	    (cli_addr.sin_addr.s_addr >> 24) & 0xff,
+	    wordswap (cli_addr.sin_port));
 }
 
-static unsigned int deassign_channel(void)
-{
-  return sys$dassgn(conn_channel);
-}
+/* Close the socket.  */
 
-static void sock_close(void)
+static void
+sock_close (void)
 {
+  struct _iosb iosb;
   unsigned int status;
 
-  status = close_socket_connection();
-  check_status(status, "Failed to close socket\n");
+  /* Close socket.  */
+  status = sys$qiow (EFN$C_ENF,           /* Event flag.  */
+		     conn_channel,        /* I/O channel.  */
+		     IO$_DEACCESS,        /* I/O function code.  */
+		     &iosb,               /* I/O status block.  */
+		     0,                   /* Ast service routine.  */
+		     0,                   /* Ast parameter.  */
+		     0, 0, 0, 0, 0, 0);
 
-  status = deassign_channel();
-  check_status(status, "Failed to deassign I/O channel\n");
+  if (status & STS$M_SUCCESS)
+    status = iosb.iosb$w_status;
+  if (!(status & STS$M_SUCCESS))
+    {
+      term_puts ("Failed to close socket\n");
+      LIB$SIGNAL (status);
+    }
+
+  /* Deassign I/O channel to network device.  */
+  status = sys$dassgn (conn_channel);
+
+  if (!(status & STS$M_SUCCESS))
+    {
+      term_puts ("Failed to deassign I/O channel\n");
+      LIB$SIGNAL (status);
+    }
 }
 
 /* Mark a page as R/W.  Return old rights.  */
@@ -749,11 +716,13 @@ static unsigned int
 page_set_rw (unsigned __int64 startva, unsigned __int64 len,
 	     unsigned int *oldprot)
 {
+  unsigned int status;
   unsigned __int64 retva;
   unsigned __int64 retlen;
 
-  return SYS$SETPRT_64 ((void *)startva, len, PSL$C_USER, PRT$C_UW,
-                        (void *)&retva, &retlen, oldprot);
+  status = SYS$SETPRT_64 ((void *)startva, len, PSL$C_USER, PRT$C_UW,
+			  (void *)&retva, &retlen, oldprot);
+  return status;
 }
 
 /* Restore page rights.  */
@@ -775,9 +744,10 @@ page_restore_rw (unsigned __int64 startva, unsigned __int64 len,
 
 /* Get the TEB (thread environment block).  */
 
-static pthread_t get_teb(void)
+static pthread_t
+get_teb (void)
 {
-    return (pthread_t)__getReg(_IA64_REG_TP);
+  return (pthread_t)__getReg (_IA64_REG_TP);
 }
 
 /* Enable thread scheduling if VAL is true.  */
@@ -855,34 +825,37 @@ write_callback (pthreadDebugClient_t context,
   return 0;
 }
 
-static int suspend_callback(pthreadDebugClient_t context)
+static int
+suspend_callback (pthreadDebugClient_t context)
 {
-    return 0;
-}
-
-static int resume_callback(pthreadDebugClient_t context)
-{
-    return 0;
+  /* Always suspended.  */
+  return 0;
 }
 
 static int
-kthdinfo_callback(pthreadDebugClient_t context,
-                  pthreadDebugKId_t kid,
-                  pthreadDebugKThreadInfo_p thread_info)
+resume_callback (pthreadDebugClient_t context)
 {
-    if (trace_pthreaddbg) {
-        term_puts("kthinfo_callback");
-    }
-    return ENOSYS;
+  /* So no need to resume.  */
+  return 0;
 }
 
-static int hold_callback(pthreadDebugClient_t context, pthreadDebugKId_t kid)
+static int
+kthdinfo_callback (pthreadDebugClient_t context,
+		   pthreadDebugKId_t kid,
+		   pthreadDebugKThreadInfo_p thread_info)
 {
-    if (trace_pthreaddbg)
-    {
-        term_puts("hold_callback");
-    }
-    return ENOSYS;
+  if (trace_pthreaddbg)
+    term_puts ("kthinfo_callback");
+  return ENOSYS;
+}
+
+static int
+hold_callback (pthreadDebugClient_t context,
+	       pthreadDebugKId_t kid)
+{
+  if (trace_pthreaddbg)
+    term_puts ("hold_callback");
+  return ENOSYS;
 }
 
 static int
@@ -934,55 +907,53 @@ setreg_callback (pthreadDebugClient_t context,
   return ENOSYS;
 }
 
-static int output_callback(pthreadDebugClient_t context, 
-                          pthreadDebugConstString_t line)
+static int
+output_callback (pthreadDebugClient_t context, 
+		 pthreadDebugConstString_t line)
 {
-    term_puts(line);
-    term_putnl();
-    return 0;
+  term_puts (line);
+  term_putnl ();
+  return 0;
 }
 
-static int error_callback(pthreadDebugClient_t context, pthreadDebugConstString_t line)
+static int
+error_callback (pthreadDebugClient_t context, 
+		 pthreadDebugConstString_t line)
 {
-    term_puts(line);
-    term_putnl();
-    return 0;
+  term_puts (line);
+  term_putnl ();
+  return 0;
 }
 
 static pthreadDebugAddr_t
 malloc_callback (pthreadDebugClient_t caller_context, size_t size)
 {
-  const size_t HEADER_SIZE = 16;
   unsigned int status;
   unsigned int res;
   int len;
 
-  len = size + HEADER_SIZE;
+  len = size + 16;
   status = lib$get_vm (&len, &res, 0);
   if (!(status & STS$M_SUCCESS))
     LIB$SIGNAL (status);
   if (trace_pthreaddbg)
     TERM_FAO ("malloc_callback (!UL) -> !XA!/", size, res);
   *(unsigned int *)res = len;
-  return (char *)res + HEADER_SIZE;
+  return (char *)res + 16;
 }
 
 static void
 free_callback (pthreadDebugClient_t caller_context, pthreadDebugAddr_t address)
 {
-  const int HEADER_OFFSET = 16;
   unsigned int status;
   unsigned int res;
   int len;
 
-  res = (unsigned int)address - HEADER_OFFSET;
+  res = (unsigned int)address - 16;
   len = *(unsigned int *)res;
-  
   if (trace_pthreaddbg)
     TERM_FAO ("free_callback (!XA)!/", address);
-  
   status = lib$free_vm (&len, &res, 0);
-  
   if (!(status & STS$M_SUCCESS))
     LIB$SIGNAL (status);
 }
@@ -1044,197 +1015,135 @@ static pthreadDebugContext_t debug_context;
 
 /* Wrapper around pthread debug entry points.  */
 
-static int pthread_debug_thd_seq_init(pthreadDebugId_t *id)
+static int
+pthread_debug_thd_seq_init (pthreadDebugId_t *id)
 {
-    typedef int (*debug_func_t)(void*, pthreadDebugId_t*);
-    debug_func_t func = (debug_func_t)pthread_debug_entries[1].func;
-    return func(debug_context, id);
+  return ((int (*)())pthread_debug_entries[1].func)
+    (debug_context, id);
 }
 
-static int pthread_debug_thd_seq_next(pthreadDebugId_t *id)
+static int
+pthread_debug_thd_seq_next (pthreadDebugId_t *id)
 {
-    typedef int (*debug_func_t)(void*, pthreadDebugId_t*);
-    
-    #define THD_SEQ_NEXT_INDEX 2
-    
-    debug_func_t func = (debug_func_t)pthread_debug_entries[THD_SEQ_NEXT_INDEX].func;
-    return func(debug_context, id);
+  return ((int (*)())pthread_debug_entries[2].func)
+    (debug_context, id);
 }
 
-static int pthread_debug_thd_seq_destroy(void)
+static int
+pthread_debug_thd_seq_destroy (void)
 {
-    #define THD_SEQ_DESTROY_INDEX 3
-    
-    typedef int (*debug_func_t)();
-    debug_func_t func = (debug_func_t)pthread_debug_entries[THD_SEQ_DESTROY_INDEX].func;
-    return func(debug_context);
+  return ((int (*)())pthread_debug_entries[3].func)
+    (debug_context);
 }
 
-static int pthread_debug_thd_get_info(pthreadDebugId_t id, pthreadDebugThreadInfo_t *info)
+static int
+pthread_debug_thd_get_info (pthreadDebugId_t id,
+			    pthreadDebugThreadInfo_t *info)
 {
-    typedef int (*debug_func_t)(void*, pthreadDebugId_t, pthreadDebugThreadInfo_t*);
-    const int THREAD_INFO_FUNC_INDEX = 4;
-    
-    debug_func_t func = (debug_func_t)pthread_debug_entries[THREAD_INFO_FUNC_INDEX].func;
-    return func(debug_context, id, info);
+  return ((int (*)())pthread_debug_entries[4].func)
+    (debug_context, id, info);
 }
 
 static int
 pthread_debug_thd_get_info_addr (pthread_t thr,
 				 pthreadDebugThreadInfo_t *info)
 {
-  typedef int (*debug_func_t)(void*, pthread_t, pthreadDebugThreadInfo_t*);
-  #define THD_GET_INFO_INDEX 5
-  
-  debug_func_t func = (debug_func_t)pthread_debug_entries[THD_GET_INFO_INDEX].func;
-  return func(debug_context, thr, info);
+  return ((int (*)())pthread_debug_entries[5].func)
+    (debug_context, thr, info);
 }
 
 static int
 pthread_debug_thd_get_reg (pthreadDebugId_t thr,
 			   pthreadDebugRegs_t *regs)
 {
-  #define PTHREAD_DEBUG_GET_REG_INDEX 6
-  typedef int (*get_reg_func_t)();
-  get_reg_func_t get_reg = (get_reg_func_t)pthread_debug_entries[PTHREAD_DEBUG_GET_REG_INDEX].func;
-  return get_reg(debug_context, thr, regs);
+  return ((int (*)())pthread_debug_entries[6].func)
+    (debug_context, thr, regs);
 }
 
 static int
 stub_pthread_debug_cmd (const char *cmd)
 {
-  #define DEBUG_CMD_INDEX 7
-  typedef int (*debug_cmd_func_t)(void*, const char*);
-  
-  debug_cmd_func_t func = (debug_cmd_func_t)pthread_debug_entries[DEBUG_CMD_INDEX].func;
-  return func(debug_context, cmd);
+  return ((int (*)())pthread_debug_entries[7].func)
+    (debug_context, cmd);
 }
 
 /* Show all the threads.  */
 
-static int initialize_thread_sequence(pthreadDebugId_t *id)
+static void
+threads_show (void)
 {
-    int res = pthread_debug_thd_seq_init(id);
-    if (res != 0)
+  pthreadDebugId_t id;
+  pthreadDebugThreadInfo_t info;
+  int res;
+
+  res = pthread_debug_thd_seq_init (&id);
+  if (res != 0)
     {
-        TERM_FAO("seq init failed, res=!SL!/", res);
+      TERM_FAO ("seq init failed, res=!SL!/", res);
+      return;
     }
-    return res;
-}
-
-static int get_thread_info(pthreadDebugId_t id, pthreadDebugThreadInfo_t *info)
-{
-    int res = pthread_debug_thd_get_info(id, info);
-    if (res != 0)
+  while (1)
     {
-        TERM_FAO("thd_get_info !SL failed!/", id);
+      if (pthread_debug_thd_get_info (id, &info) != 0)
+	{
+	  TERM_FAO ("thd_get_info !SL failed!/", id);
+	  break;
+	}
+      if (pthread_debug_thd_seq_next (&id) != 0)
+	break;
     }
-    return res;
-}
-
-static int advance_to_next_thread(pthreadDebugId_t *id)
-{
-    return pthread_debug_thd_seq_next(id);
-}
-
-static void process_all_threads(pthreadDebugId_t id)
-{
-    pthreadDebugThreadInfo_t info;
-    
-    while (1)
-    {
-        if (get_thread_info(id, &info) != 0)
-            break;
-        
-        if (advance_to_next_thread(&id) != 0)
-            break;
-    }
-}
-
-static void threads_show(void)
-{
-    pthreadDebugId_t id;
-    
-    if (initialize_thread_sequence(&id) != 0)
-        return;
-    
-    process_all_threads(id);
-    pthread_debug_thd_seq_destroy();
+  pthread_debug_thd_seq_destroy ();
 }
 
 /* Initialize pthread support.  */
 
-static void find_image_symbol_or_signal(void *image_desc, void *symbol_desc, int *result)
+static void
+threads_init (void)
 {
-    int status = lib$find_image_symbol(image_desc, symbol_desc, result);
-    if (!(status & STS$M_SUCCESS))
-        LIB$SIGNAL(status);
-}
+  static const $DESCRIPTOR (dbgext_desc, "PTHREAD$DBGEXT");
+  static const $DESCRIPTOR (pthread_debug_desc, "PTHREAD$DBGSHR");
+  static const $DESCRIPTOR (dbgsymtable_desc, "PTHREAD_DBG_SYMTABLE");
+  int pthread_dbgext;
+  int status;
+  void *dbg_symtable;
+  int i;
+  void *caller_context = 0;
 
-static void load_pthread_debug_entries(void)
-{
-    static const $DESCRIPTOR(pthread_debug_desc, "PTHREAD$DBGSHR");
-    
-    int entry_count = sizeof(pthread_debug_entries) / sizeof(pthread_debug_entries[0]);
-    
-    for (int i = 0; i < entry_count; i++)
+  status = lib$find_image_symbol
+    ((void *) &pthread_rtl_desc, (void *) &dbgext_desc,
+     (int *) &dbgext_func);
+  if (!(status & STS$M_SUCCESS))
+    LIB$SIGNAL (status);
+  
+  status = lib$find_image_symbol
+    ((void *) &pthread_rtl_desc, (void *) &dbgsymtable_desc,
+     (int *) &dbg_symtable);
+  if (!(status & STS$M_SUCCESS))
+    LIB$SIGNAL (status);
+
+  /* Find entry points in pthread_debug.  */
+  for (i = 0;
+       i < sizeof (pthread_debug_entries) / sizeof (pthread_debug_entries[0]);
+       i++)
     {
-        struct dsc$descriptor_s sym = {
-            pthread_debug_entries[i].namelen,
-            DSC$K_DTYPE_T,
-            DSC$K_CLASS_S,
-            pthread_debug_entries[i].name
-        };
-        
-        int status = lib$find_image_symbol(
-            (void *)&pthread_debug_desc,
-            (void *)&sym,
-            (int *)&pthread_debug_entries[i].func);
-            
-        if (!(status & STS$M_SUCCESS))
-            lib$signal(status);
+      struct dsc$descriptor_s sym =
+	{ pthread_debug_entries[i].namelen,
+	  DSC$K_DTYPE_T, DSC$K_CLASS_S,
+	  pthread_debug_entries[i].name };
+      status = lib$find_image_symbol
+	((void *) &pthread_debug_desc, (void *) &sym,
+	 (int *) &pthread_debug_entries[i].func);
+      if (!(status & STS$M_SUCCESS))
+	lib$signal (status);
     }
-}
 
-static void initialize_pthread_debug(void *dbg_symtable)
-{
-    void *caller_context = 0;
-    
-    if (trace_pthreaddbg)
-        TERM_FAO("debug symtable: !XH!/", dbg_symtable);
-        
-    int status = ((int (*)())pthread_debug_entries[0].func)(
-        &caller_context,
-        &pthread_debug_callbacks,
-        dbg_symtable,
-        &debug_context);
-        
-    if (status != 0)
-        TERM_FAO("cannot initialize pthread_debug: !UL!/", status);
-        
-    TERM_FAO("pthread debug done!/", 0);
-}
-
-static void threads_init(void)
-{
-    static const $DESCRIPTOR(dbgext_desc, "PTHREAD$DBGEXT");
-    static const $DESCRIPTOR(dbgsymtable_desc, "PTHREAD_DBG_SYMTABLE");
-    
-    int pthread_dbgext;
-    void *dbg_symtable;
-    
-    find_image_symbol_or_signal(
-        (void *)&pthread_rtl_desc,
-        (void *)&dbgext_desc,
-        (int *)&dbgext_func);
-    
-    find_image_symbol_or_signal(
-        (void *)&pthread_rtl_desc,
-        (void *)&dbgsymtable_desc,
-        (int *)&dbg_symtable);
-    
-    load_pthread_debug_entries();
-    initialize_pthread_debug(dbg_symtable);
+  if (trace_pthreaddbg)
+    TERM_FAO ("debug symtable: !XH!/", dbg_symtable);
+  status = ((int (*)()) pthread_debug_entries[0].func)
+    (&caller_context, &pthread_debug_callbacks, dbg_symtable, &debug_context);
+  if (status != 0)
+    TERM_FAO ("cannot initialize pthread_debug: !UL!/", status);
+  TERM_FAO ("pthread debug done!/", 0);
 }
 
 /* Convert an hexadecimal character to a nibble.  Return -1 in case of
@@ -1258,57 +1167,48 @@ hex2nibble (unsigned char h)
 static int
 hex2byte (const unsigned char *p)
 {
-  int high_nibble = hex2nibble (p[0]);
-  int low_nibble = hex2nibble (p[1]);
-  
-  if (high_nibble == -1 || low_nibble == -1)
+  int h, l;
+
+  h = hex2nibble (p[0]);
+  l = hex2nibble (p[1]);
+  if (h == -1 || l == -1)
     return -1;
-    
-  return (high_nibble << 4) | low_nibble;
+  return (h << 4) | l;
 }
 
 /* Convert a byte V to a 2 character strings P.  */
 
-static void byte2hex(unsigned char *p, unsigned char v)
+static void
+byte2hex (unsigned char *p, unsigned char v)
 {
-    static const char HEX_UPPER_NIBBLE_SHIFT = 4;
-    static const char HEX_LOWER_NIBBLE_MASK = 0xF;
-    
-    p[0] = hex[v >> HEX_UPPER_NIBBLE_SHIFT];
-    p[1] = hex[v & HEX_LOWER_NIBBLE_MASK];
+  p[0] = hex[v >> 4];
+  p[1] = hex[v & 0xf];
 }
 
 /* Convert a quadword V to a 16 character strings P.  */
 
-static void quad2hex(unsigned char *p, unsigned __int64 v)
+static void
+quad2hex (unsigned char *p, unsigned __int64 v)
 {
-    const int HEX_DIGITS = 16;
-    const int SHIFT_BITS = 60;
-    const int BITS_PER_HEX = 4;
-    
-    for (int i = 0; i < HEX_DIGITS; i++)
+  int i;
+  for (i = 0; i < 16; i++)
     {
-        p[i] = hex[v >> SHIFT_BITS];
-        v <<= BITS_PER_HEX;
+      p[i] = hex[v >> 60];
+      v <<= 4;
     }
 }
 
 static void
 long2pkt (unsigned int v)
 {
-  const int HEX_DIGITS = 8;
-  const int BITS_PER_HEX = 4;
-  const unsigned int HEX_MASK = 0x0f;
-  const int HIGH_NIBBLE_SHIFT = 28;
-  
   int i;
 
-  for (i = 0; i < HEX_DIGITS; i++)
+  for (i = 0; i < 8; i++)
     {
-      gdb_buf[gdb_blen + i] = hex[(v >> HIGH_NIBBLE_SHIFT) & HEX_MASK];
-      v <<= BITS_PER_HEX;
+      gdb_buf[gdb_blen + i] = hex[(v >> 28) & 0x0f];
+      v <<= 4;
     }
-  gdb_blen += HEX_DIGITS;
+  gdb_blen += 8;
 }
 
 /* Generate an error packet.  */
@@ -1336,14 +1236,12 @@ packet_ok (void)
 static void
 ireg2pkt (const unsigned char *p)
 {
-  const int REGISTER_SIZE = 8;
-  const int HEX_CHARS_PER_BYTE = 2;
   int i;
 
-  for (i = 0; i < REGISTER_SIZE; i++)
+  for (i = 0; i < 8; i++)
     {
       byte2hex (gdb_buf + gdb_blen, p[i]);
-      gdb_blen += HEX_CHARS_PER_BYTE;
+      gdb_blen += 2;
     }
 }
 
@@ -1377,32 +1275,25 @@ pkt2val (const unsigned char *pkt, unsigned int *pos)
 
 /* Append LEN bytes from B to the current gdb packet (encode in binary).  */
 
-static void encode_special_char(unsigned char c)
+static void
+mem2bin (const unsigned char *b, unsigned int len)
 {
-    gdb_buf[gdb_blen++] = '}';
-    gdb_buf[gdb_blen++] = c ^ 0x20;
-}
-
-static int is_special_char(unsigned char c)
-{
-    return c == '#' || c == '$' || c == '}' || c == '*' || c == 0;
-}
-
-static void append_char(unsigned char c)
-{
-    if (is_special_char(c)) {
-        encode_special_char(c);
-    } else {
-        gdb_buf[gdb_blen++] = c;
-    }
-}
-
-static void mem2bin(const unsigned char *b, unsigned int len)
-{
-    unsigned int i;
-    for (i = 0; i < len; i++) {
-        append_char(b[i]);
-    }
+  unsigned int i;
+  for (i = 0; i < len; i++)
+    switch (b[i])
+      {
+      case '#':
+      case '$':
+      case '}':
+      case '*':
+      case 0:
+	gdb_buf[gdb_blen++] = '}';
+	gdb_buf[gdb_blen++] = b[i] ^ 0x20;
+	break;
+      default:
+	gdb_buf[gdb_blen++] = b[i];
+	break;
+      }
 }
 
 /* Append LEN bytes from B to the current gdb packet (encode in hex).  */
@@ -1411,197 +1302,191 @@ static void
 mem2hex (const unsigned char *b, unsigned int len)
 {
   unsigned int i;
-  const int HEX_CHARS_PER_BYTE = 2;
-  
   for (i = 0; i < len; i++)
     {
       byte2hex (gdb_buf + gdb_blen, b[i]);
-      gdb_blen += HEX_CHARS_PER_BYTE;
+      gdb_blen += 2;
     }
 }
 
 /* Handle the 'q' packet.  */
 
-static void handle_qc_packet(void)
+static void
+handle_q_packet (const unsigned char *pkt, unsigned int pktlen)
 {
-    gdb_buf[0] = '$';
-    gdb_buf[1] = 'Q';
-    gdb_buf[2] = 'C';
-    gdb_blen = 3;
-    if (has_threads)
-        long2pkt((unsigned long)get_teb());
-}
+  /* For qfThreadInfo and qsThreadInfo.  */
+  static unsigned int first_thread;
+  static unsigned int last_thread;
 
-static int parse_xfer_uib_request(const unsigned char *pkt, unsigned int *pos, 
-                                  unsigned __int64 *pc, unsigned int *off, unsigned int *len)
-{
-    *pc = pkt2val(pkt, pos);
-    if (pkt[*pos] != ':')
-        return 0;
-    (*pos)++;
-    *off = pkt2val(pkt, pos);
-    if (pkt[*pos] != ',' || *off != 0)
-        return 0;
-    (*pos)++;
-    *len = pkt2val(pkt, pos);
-    if (pkt[*pos] != '#' || *len != 0x20)
-        return 0;
-    return 1;
-}
+  static const char xfer_uib[] = "qXfer:uib:read:";
+#define XFER_UIB_LEN (sizeof (xfer_uib) - 1)
+  static const char qfthreadinfo[] = "qfThreadInfo";
+#define QFTHREADINFO_LEN (sizeof (qfthreadinfo) - 1)
+  static const char qsthreadinfo[] = "qsThreadInfo";
+#define QSTHREADINFO_LEN (sizeof (qsthreadinfo) - 1)
+  static const char qthreadextrainfo[] = "qThreadExtraInfo,";
+#define QTHREADEXTRAINFO_LEN (sizeof (qthreadextrainfo) - 1)
+  static const char qsupported[] = "qSupported:";
+#define QSUPPORTED_LEN (sizeof (qsupported) - 1)
 
-static void handle_xfer_uib_packet(const unsigned char *pkt)
-{
-    static const unsigned int XFER_UIB_LEN = 15;
-    unsigned __int64 pc;
-    unsigned int pos = XFER_UIB_LEN;
-    unsigned int off, len;
-    union {
-        unsigned char bytes[32];
-        struct {
-            unsigned __int64 code_start_va;
-            unsigned __int64 code_end_va;
-            unsigned __int64 uib_start_va;
-            unsigned __int64 gp_value;
-        } data;
-    } uei;
-    int res;
-
-    packet_error(0);
-
-    if (!parse_xfer_uib_request(pkt, &pos, &pc, &off, &len))
-        return;
-
-    res = SYS$GET_UNWIND_ENTRY_INFO(pc, &uei.data, 0);
-    if (res == SS$_NODATA || res != SS$_NORMAL)
-        ots$fill(uei.bytes, sizeof(uei.bytes), 0);
-
-    if (trace_unwind)
-        TERM_FAO("Unwind request for !XH, status=!XL, uib=!XQ, GP=!XQ!/",
-                pc, res, uei.data.uib_start_va, uei.data.gp_value);
-
-    gdb_buf[0] = '$';
-    gdb_buf[1] = 'l';
-    gdb_blen = 2;
-    mem2bin(uei.bytes, sizeof(uei.bytes));
-}
-
-static void handle_qfthreadinfo_packet(void)
-{
-    static unsigned int first_thread;
-    static unsigned int last_thread;
-    
-    gdb_buf[0] = '$';
-    gdb_buf[1] = 'm';
-    gdb_blen = 2;
-
-    if (!has_threads) {
-        gdb_buf[1] = 'l';
-        return;
+  if (pktlen == 2 && pkt[1] == 'C')
+    {
+      /* Current thread.  */
+      gdb_buf[0] = '$';
+      gdb_buf[1] = 'Q';
+      gdb_buf[2] = 'C';
+      gdb_blen = 3;
+      if (has_threads)
+	long2pkt ((unsigned long) get_teb ());
+      return;
     }
-    first_thread = thread_next(0);
-    last_thread = first_thread;
-    long2pkt(first_thread);
-}
+  else if (pktlen > XFER_UIB_LEN
+      && ots$strcmp_eql (pkt, XFER_UIB_LEN, xfer_uib, XFER_UIB_LEN))
+    {
+      /* Get unwind information block.  */
+      unsigned __int64 pc;
+      unsigned int pos = XFER_UIB_LEN;
+      unsigned int off;
+      unsigned int len;
+      union
+      {
+	unsigned char bytes[32];
+	struct
+	{
+	  unsigned __int64 code_start_va;
+	  unsigned __int64 code_end_va;
+	  unsigned __int64 uib_start_va;
+	  unsigned __int64 gp_value;
+	} data;
+      } uei;
+      int res;
+      int i;
 
-static void handle_qsthreadinfo_packet(void)
-{
-    static unsigned int first_thread;
-    static unsigned int last_thread;
-    
-    gdb_buf[0] = '$';
-    gdb_buf[1] = 'm';
-    gdb_blen = 2;
-    
-    while (dbgext_func) {
-        unsigned int res = thread_next(last_thread);
-        if (res == first_thread)
-            break;
-        if (gdb_blen > 2)
-            gdb_buf[gdb_blen++] = ',';
-        long2pkt(res);
-        last_thread = res;
-        if (gdb_blen > sizeof(gdb_buf) - 16)
-            break;
+      packet_error (0);
+
+      pc = pkt2val (pkt, &pos);
+      if (pkt[pos] != ':')
+	return;
+      pos++;
+      off = pkt2val (pkt, &pos);
+      if (pkt[pos] != ',' || off != 0)
+	return;
+      pos++;
+      len = pkt2val (pkt, &pos);
+      if (pkt[pos] != '#' || len != 0x20)
+	return;
+
+      res = SYS$GET_UNWIND_ENTRY_INFO (pc, &uei.data, 0);
+      if (res == SS$_NODATA || res != SS$_NORMAL)
+	ots$fill (uei.bytes, sizeof (uei.bytes), 0);
+
+      if (trace_unwind)
+	{
+	  TERM_FAO ("Unwind request for !XH, status=!XL, uib=!XQ, GP=!XQ!/",
+		    pc, res, uei.data.uib_start_va, uei.data.gp_value);
+	}
+
+      gdb_buf[0] = '$';
+      gdb_buf[1] = 'l';
+      gdb_blen = 2;
+      mem2bin (uei.bytes, sizeof (uei.bytes));
     }
+  else if (pktlen == QFTHREADINFO_LEN
+	   && ots$strcmp_eql (pkt, QFTHREADINFO_LEN,
+			      qfthreadinfo, QFTHREADINFO_LEN))
+    {
+      /* Get first thread(s).  */
+      gdb_buf[0] = '$';
+      gdb_buf[1] = 'm';
+      gdb_blen = 2;
 
-    if (gdb_blen == 2)
-        gdb_buf[1] = 'l';
-}
-
-static void handle_qthreadextrainfo_packet(const unsigned char *pkt)
-{
-    static const unsigned int QTHREADEXTRAINFO_LEN = 17;
-    pthread_t thr;
-    unsigned int pos = QTHREADEXTRAINFO_LEN;
-    pthreadDebugThreadInfo_t info;
-    int res;
-
-    packet_error(0);
-    if (!has_threads)
-        return;
-
-    thr = (pthread_t)pkt2val(pkt, &pos);
-    if (pkt[pos] != '#')
-        return;
-    res = pthread_debug_thd_get_info_addr(thr, &info);
-    if (res != 0) {
-        TERM_FAO("qThreadExtraInfo (!XH) failed: !SL!/", thr, res);
-        return;
+      if (!has_threads)
+	{
+	  gdb_buf[1] = 'l';
+	  return;
+	}
+      first_thread = thread_next (0);
+      last_thread = first_thread;
+      long2pkt (first_thread);
     }
-    gdb_buf[0] = '$';
-    gdb_blen = 1;
-    mem2hex((const unsigned char *)"VMS-thread", 11);
-}
+  else if (pktlen == QSTHREADINFO_LEN
+	   && ots$strcmp_eql (pkt, QSTHREADINFO_LEN,
+			      qsthreadinfo, QSTHREADINFO_LEN))
+    {
+      /* Get subsequent threads.  */
+      gdb_buf[0] = '$';
+      gdb_buf[1] = 'm';
+      gdb_blen = 2;
+      while (dbgext_func)
+	{
+	  unsigned int res;
+	  res = thread_next (last_thread);
+	  if (res == first_thread)
+	    break;
+	  if (gdb_blen > 2)
+	    gdb_buf[gdb_blen++] = ',';
+	  long2pkt (res);
+	  last_thread = res;
+	  if (gdb_blen > sizeof (gdb_buf) - 16)
+	    break;
+	}
 
-static void handle_qsupported_packet(void)
-{
-    gdb_buf[0] = '$';
-    gdb_blen = 1;
-    str2pkt("qXfer:uib:read+");
-}
-
-static void handle_unknown_packet(const unsigned char *pkt, unsigned int pktlen)
-{
-    if (trace_pkt) {
-        term_puts("unknown <: ");
-        term_write((char *)pkt, pktlen);
-        term_putnl();
+      if (gdb_blen == 2)
+	gdb_buf[1] = 'l';
     }
-}
+  else if (pktlen > QTHREADEXTRAINFO_LEN
+	   && ots$strcmp_eql (pkt, QTHREADEXTRAINFO_LEN,
+			      qthreadextrainfo, QTHREADEXTRAINFO_LEN))
+    {
+      /* Get extra info about a thread.  */
+      pthread_t thr;
+      unsigned int pos = QTHREADEXTRAINFO_LEN;
+      pthreadDebugThreadInfo_t info;
+      int res;
 
-static void handle_q_packet(const unsigned char *pkt, unsigned int pktlen)
-{
-    static const char xfer_uib[] = "qXfer:uib:read:";
-    static const char qfthreadinfo[] = "qfThreadInfo";
-    static const char qsthreadinfo[] = "qsThreadInfo";
-    static const char qthreadextrainfo[] = "qThreadExtraInfo,";
-    static const char qsupported[] = "qSupported:";
-    
-    static const unsigned int XFER_UIB_LEN = 15;
-    static const unsigned int QFTHREADINFO_LEN = 12;
-    static const unsigned int QSTHREADINFO_LEN = 12;
-    static const unsigned int QTHREADEXTRAINFO_LEN = 17;
-    static const unsigned int QSUPPORTED_LEN = 11;
+      packet_error (0);
+      if (!has_threads)
+	return;
 
-    if (pktlen == 2 && pkt[1] == 'C') {
-        handle_qc_packet();
-    } else if (pktlen > XFER_UIB_LEN && 
-               ots$strcmp_eql(pkt, XFER_UIB_LEN, xfer_uib, XFER_UIB_LEN)) {
-        handle_xfer_uib_packet(pkt);
-    } else if (pktlen == QFTHREADINFO_LEN &&
-               ots$strcmp_eql(pkt, QFTHREADINFO_LEN, qfthreadinfo, QFTHREADINFO_LEN)) {
-        handle_qfthreadinfo_packet();
-    } else if (pktlen == QSTHREADINFO_LEN &&
-               ots$strcmp_eql(pkt, QSTHREADINFO_LEN, qsthreadinfo, QSTHREADINFO_LEN)) {
-        handle_qsthreadinfo_packet();
-    } else if (pktlen > QTHREADEXTRAINFO_LEN &&
-               ots$strcmp_eql(pkt, QTHREADEXTRAINFO_LEN, qthreadextrainfo, QTHREADEXTRAINFO_LEN)) {
-        handle_qthreadextrainfo_packet(pkt);
-    } else if (pktlen > QSUPPORTED_LEN &&
-               ots$strcmp_eql(pkt, QSUPPORTED_LEN, qsupported, QSUPPORTED_LEN)) {
-        handle_qsupported_packet();
-    } else {
-        handle_unknown_packet(pkt, pktlen);
+      thr = (pthread_t) pkt2val (pkt, &pos);
+      if (pkt[pos] != '#')
+	return;
+      res = pthread_debug_thd_get_info_addr (thr, &info);
+      if (res != 0)
+	{
+	  TERM_FAO ("qThreadExtraInfo (!XH) failed: !SL!/", thr, res);
+	  return;
+	}
+      gdb_buf[0] = '$';
+      gdb_blen = 1;
+      mem2hex ((const unsigned char *)"VMS-thread", 11);
+    }
+  else if (pktlen > QSUPPORTED_LEN
+	   && ots$strcmp_eql (pkt, QSUPPORTED_LEN,
+			      qsupported, QSUPPORTED_LEN))
+    {
+      /* Get supported features.  */
+      pthread_t thr;
+      unsigned int pos = QSUPPORTED_LEN;
+      pthreadDebugThreadInfo_t info;
+      int res;
+      
+      /* Ignore gdb features.  */
+      gdb_buf[0] = '$';
+      gdb_blen = 1;
+
+      str2pkt ("qXfer:uib:read+");
+      return;
+    }
+  else
+    {
+      if (trace_pkt)
+	{
+	  term_puts ("unknown <: ");
+	  term_write ((char *)pkt, pktlen);
+	  term_putnl ();
+	}
+      return;
     }
 }
 
@@ -1622,14 +1507,16 @@ handle_v_packet (const unsigned char *pkt, unsigned int pktlen)
       str2pkt ("vCont;c;s");
       return 0;
     }
-  
-  if (trace_pkt)
+  else
     {
-      term_puts ("unknown <: ");
-      term_write ((char *)pkt, pktlen);
-      term_putnl ();
+      if (trace_pkt)
+	{
+	  term_puts ("unknown <: ");
+	  term_write ((char *)pkt, pktlen);
+	  term_putnl ();
+	}
+      return 0;
     }
-  return 0;
 }
 
 /* Get regs for the selected thread.  */
@@ -1637,48 +1524,40 @@ handle_v_packet (const unsigned char *pkt, unsigned int pktlen)
 static struct ia64_all_regs *
 get_selected_regs (void)
 {
+  pthreadDebugRegs_t regs;
+  int res;
+
   if (selected_thread == 0 || selected_thread == get_teb ())
     return &excp_regs;
 
   if (selected_thread == sel_regs_pthread)
     return &sel_regs;
 
-  return read_and_convert_thread_regs();
-}
-
-static struct ia64_all_regs *
-read_and_convert_thread_regs (void)
-{
-  pthreadDebugRegs_t regs;
-  int res = pthread_debug_thd_get_reg (selected_id, &regs);
-  
+  /* Read registers.  */
+  res = pthread_debug_thd_get_reg (selected_id, &regs);
   if (res != 0)
-    return &excp_regs;
-    
+    {
+      /* FIXME: return NULL ?  */
+      return &excp_regs;
+    }
   sel_regs_pthread = selected_thread;
-  copy_pthread_regs_to_sel_regs(&regs);
+  sel_regs.gr[1].v = regs.gp;
+  sel_regs.gr[4].v = regs.r4;
+  sel_regs.gr[5].v = regs.r5;
+  sel_regs.gr[6].v = regs.r6;
+  sel_regs.gr[7].v = regs.r7;
+  sel_regs.gr[12].v = regs.sp;
+  sel_regs.br[0].v = regs.rp;
+  sel_regs.br[1].v = regs.b1;
+  sel_regs.br[2].v = regs.b2;
+  sel_regs.br[3].v = regs.b3;
+  sel_regs.br[4].v = regs.b4;
+  sel_regs.br[5].v = regs.b5;
+  sel_regs.ip.v = regs.ip;
+  sel_regs.bsp.v = regs.bspstore; /* FIXME: it is correct ?  */
+  sel_regs.pfs.v = regs.pfs;
+  sel_regs.pr.v = regs.pr;
   return &sel_regs;
-}
-
-static void
-copy_pthread_regs_to_sel_regs (pthreadDebugRegs_t *regs)
-{
-  sel_regs.gr[1].v = regs->gp;
-  sel_regs.gr[4].v = regs->r4;
-  sel_regs.gr[5].v = regs->r5;
-  sel_regs.gr[6].v = regs->r6;
-  sel_regs.gr[7].v = regs->r7;
-  sel_regs.gr[12].v = regs->sp;
-  sel_regs.br[0].v = regs->rp;
-  sel_regs.br[1].v = regs->b1;
-  sel_regs.br[2].v = regs->b2;
-  sel_regs.br[3].v = regs->b3;
-  sel_regs.br[4].v = regs->b4;
-  sel_regs.br[5].v = regs->b5;
-  sel_regs.ip.v = regs->ip;
-  sel_regs.bsp.v = regs->bspstore;
-  sel_regs.pfs.v = regs->pfs;
-  sel_regs.pr.v = regs->pr;
 }
 
 /* Create a status packet.  */
@@ -1687,7 +1566,6 @@ static void
 packet_status (void)
 {
   gdb_blen = 0;
-  
   if (has_threads)
     {
       str2pkt ("$T05thread:");
@@ -1695,347 +1573,328 @@ packet_status (void)
       gdb_buf[gdb_blen++] = ';';
     }
   else
-    {
-      str2pkt ("$S05");
-    }
+    str2pkt ("$S05");
 }
 
 /* Return 1 to continue.  */
 
-#define PSR_SS_MASK ((unsigned __int64)PSR$M_SS)
+static int
+handle_packet (unsigned char *pkt, unsigned int len)
+{
+  unsigned int pos;
 
-static void initialize_response(void) {
-    gdb_buf[0] = '$';
-    gdb_blen = 1;
-}
+  /* By default, reply unsupported.  */
+  gdb_buf[0] = '$';
+  gdb_blen = 1;
 
-static int validate_single_char_packet(unsigned int len) {
-    return len == 1;
-}
-
-static int validate_packet_position(unsigned char expected_char, unsigned char actual_char, unsigned int pos, unsigned int len) {
-    if (actual_char != expected_char) {
-        packet_error (0);
-        return 0;
-    }
-    if (expected_char == '#' && pos != len) {
-        packet_error (0);
-        return 0;
-    }
-    return 1;
-}
-
-static int check_memory_access_read(unsigned __int64 addr, unsigned int length) {
-    unsigned int i = length + (addr & VMS_PAGE_MASK);
-    unsigned __int64 paddr = addr & ~VMS_PAGE_MASK;
-    
-    while (1) {
-        if (__prober (paddr, 0) != 1) {
-            packet_error (2);
-            return 0;
-        }
-        if (i < VMS_PAGE_SIZE)
-            break;
-        i -= VMS_PAGE_SIZE;
-        paddr += VMS_PAGE_SIZE;
-    }
-    return 1;
-}
-
-static int check_memory_access_write(unsigned __int64 addr, unsigned int length, unsigned int oldprot) {
-    unsigned int i = length + (addr & VMS_PAGE_MASK);
-    unsigned __int64 paddr = addr & ~VMS_PAGE_MASK;
-    
-    while (1) {
-        if (__probew (paddr, 0) != 1) {
-            page_restore_rw (addr, length, oldprot);
-            return 0;
-        }
-        if (i < VMS_PAGE_SIZE)
-            break;
-        i -= VMS_PAGE_SIZE;
-        paddr += VMS_PAGE_SIZE;
-    }
-    return 1;
-}
-
-static void transfer_memory_to_packet(unsigned __int64 addr, unsigned int length) {
-    unsigned int i;
-    for (i = 0; i < length; i++)
-        byte2hex (gdb_buf + 1 + 2 * i, ((unsigned char *)addr)[i]);
-    gdb_blen += 2 * length;
-}
-
-static void write_memory_from_packet(unsigned char *pkt, unsigned int *pos, unsigned __int64 addr, unsigned int length) {
-    unsigned int i;
-    for (i = 0; i < length; i++) {
-        int v = hex2byte (pkt + *pos);
-        *pos += 2;
-        ((unsigned char *)addr)[i] = v;
-    }
-}
-
-static void sync_instruction_cache(unsigned __int64 addr, unsigned int length) {
-    unsigned int i;
-    for (i = 0; i < length; i += 15)
-        __fc (addr + i);
-    __fc (addr + length);
-}
-
-static int handle_thread_select(unsigned __int64 val) {
-    if (val == 0) {
-        selected_thread = get_teb ();
-        selected_id = 0;
-        return 1;
-    }
-    
-    if (!has_threads) {
-        packet_error (0);
-        return 0;
-    }
-    
-    int res;
-    pthreadDebugThreadInfo_t info;
-    res = pthread_debug_thd_get_info_addr ((pthread_t) val, &info);
-    if (res != 0) {
-        TERM_FAO ("qThreadExtraInfo (!XH) failed: !SL!/", val, res);
-        packet_error (0);
-        return 0;
-    }
-    selected_thread = info.teb;
-    selected_id = info.sequence;
-    return 1;
-}
-
-static void handle_register_read(unsigned int num) {
-    struct ia64_all_regs *regs = get_selected_regs ();
-    
-    switch (num) {
-    case IA64_IP_REGNUM:
-        ireg2pkt (regs->ip.b);
-        break;
-    case IA64_BR0_REGNUM:
-        ireg2pkt (regs->br[0].b);
-        break;
-    case IA64_PSR_REGNUM:
-        ireg2pkt (regs->psr.b);
-        break;
-    case IA64_BSP_REGNUM:
-        ireg2pkt (regs->bsp.b);
-        break;
-    case IA64_CFM_REGNUM:
-        ireg2pkt (regs->cfm.b);
-        break;
-    case IA64_PFS_REGNUM:
-        ireg2pkt (regs->pfs.b);
-        break;
-    case IA64_PR_REGNUM:
-        ireg2pkt (regs->pr.b);
-        break;
-    default:
-        TERM_FAO ("gdbserv: unhandled reg !UW!/", num);
-        packet_error (0);
-        break;
-    }
-}
-
-static int handle_thread_status(unsigned char *pkt, unsigned int *pos, unsigned int len) {
-    if (!has_threads) {
-        packet_ok ();
-        return 0;
-    }
-    
-    unsigned __int64 val = pkt2val (pkt, pos);
-    packet_error (0);
-    
-    if (*pos != len)
-        return 0;
-    
-    unsigned int fthr = thread_next (0);
-    unsigned int thr = fthr;
-    do {
-        if (val == thr) {
-            packet_ok ();
-            break;
-        }
-        thr = thread_next (thr);
-    } while (thr != fthr);
-    
-    return 0;
-}
-
-static int handle_question_mark(unsigned int len) {
-    if (validate_single_char_packet(len)) {
-        packet_status ();
-        return 0;
-    }
-    return 0;
-}
-
-static int handle_continue(unsigned int len) {
-    if (validate_single_char_packet(len)) {
-        excp_regs.psr.v &= ~PSR_SS_MASK;
-        return 1;
-    }
-    packet_error (0);
-    return 0;
-}
-
-static int handle_general_registers(unsigned int len) {
-    if (validate_single_char_packet(len)) {
-        unsigned int i;
-        struct ia64_all_regs *regs = get_selected_regs ();
-        unsigned char *p = regs->gr[0].b;
-        
-        for (i = 0; i < 8 * 32; i++)
-            byte2hex (gdb_buf + 1 + 2 * i, p[i]);
-        gdb_blen += 2 * 8 * 32;
-    }
-    return 0;
-}
-
-static int handle_H_packet(unsigned char *pkt, unsigned int *pos, unsigned int len) {
-    if (pkt[1] == 'g') {
-        (*pos)++;
-        unsigned __int64 val = pkt2val (pkt, pos);
-        if (*pos != len) {
-            packet_error (0);
-            return 0;
-        }
-        
-        if (handle_thread_select(val))
-            packet_ok ();
-        return 0;
-    }
-    
-    if (pkt[1] == 'c' && 
-        ((pkt[2] == '-' && pkt[3] == '1' && len == 4) ||
-         (pkt[2] == '0' && len == 3))) {
-        packet_ok ();
-        return 0;
-    }
-    
-    packet_error (0);
-    return 0;
-}
-
-static int handle_memory_read(unsigned char *pkt, unsigned int *pos) {
-    unsigned __int64 addr = pkt2val (pkt, pos);
-    if (!validate_packet_position(',', pkt[*pos], *pos, 0))
-        return 0;
-    
-    (*pos)++;
-    unsigned int l = pkt2val (pkt, pos);
-    if (!validate_packet_position('#', pkt[*pos], *pos, 0))
-        return 0;
-    
-    if (!check_memory_access_read(addr, l))
-        return 0;
-    
-    transfer_memory_to_packet(addr, l);
-    return 0;
-}
-
-static int handle_memory_write(unsigned char *pkt, unsigned int *pos) {
-    unsigned __int64 addr = pkt2val (pkt, pos);
-    if (!validate_packet_position(',', pkt[*pos], *pos, 0))
-        return 0;
-    
-    (*pos)++;
-    unsigned int l = pkt2val (pkt, pos);
-    if (!validate_packet_position(':', pkt[*pos], *pos, 0))
-        return 0;
-    
-    (*pos)++;
-    unsigned int oldprot;
-    page_set_rw (addr, l, &oldprot);
-    
-    if (!check_memory_access_write(addr, l, oldprot))
-        return 0;
-    
-    write_memory_from_packet(pkt, pos, addr, l);
-    sync_instruction_cache(addr, l);
-    page_restore_rw (addr, l, oldprot);
-    packet_ok ();
-    return 0;
-}
-
-static int handle_register_packet(unsigned char *pkt, unsigned int *pos, unsigned int len) {
-    unsigned int num = pkt2val (pkt, pos);
-    if (*pos != len) {
-        packet_error (0);
-        return 0;
-    }
-    
-    handle_register_read(num);
-    return 0;
-}
-
-static int handle_step(unsigned int len) {
-    if (validate_single_char_packet(len)) {
-        excp_regs.psr.v |= PSR_SS_MASK;
-        return 1;
-    }
-    packet_error (0);
-    return 0;
-}
-
-static int handle_VMS_extension(unsigned char *pkt, unsigned int len) {
-    if (len > 3 && pkt[1] == 'M' && pkt[2] == 'S' && pkt[3] == ' ') {
-        if (has_threads) {
-            pkt[len] = 0;
-            stub_pthread_debug_cmd ((char *)pkt + 4);
-            packet_ok ();
-        } else {
-            packet_error (0);
-        }
-    }
-    return 0;
-}
-
-static int handle_packet (unsigned char *pkt, unsigned int len) {
-    unsigned int pos = 1;
-    
-    initialize_response();
-    
-    switch (pkt[0]) {
+  pos = 1;
+  switch (pkt[0])
+    {
     case '?':
-        return handle_question_mark(len);
+      if (len == 1)
+	{
+	  packet_status ();
+	  return 0;
+	}
+      break;
     case 'c':
-        return handle_continue(len);
+      if (len == 1)
+	{
+	  /* Clear psr.ss.  */
+	  excp_regs.psr.v &= ~(unsigned __int64)PSR$M_SS;
+	  return 1;
+	}
+      else
+	packet_error (0);
+      break;
     case 'g':
-        return handle_general_registers(len);
+      if (len == 1)
+	{
+	  unsigned int i;
+	  struct ia64_all_regs *regs = get_selected_regs ();
+	  unsigned char *p = regs->gr[0].b;
+
+	  for (i = 0; i < 8 * 32; i++)
+	    byte2hex (gdb_buf + 1 + 2 * i, p[i]);
+	  gdb_blen += 2 * 8 * 32;
+	  return 0;
+	}
+      break;
     case 'H':
-        return handle_H_packet(pkt, &pos, len);
+      if (pkt[1] == 'g')
+	{
+	  int res;
+	  unsigned __int64 val;
+	  pthreadDebugThreadInfo_t info;
+	  
+	  pos++;
+	  val = pkt2val (pkt, &pos);
+	  if (pos != len)
+	    {
+	      packet_error (0);
+	      return 0;
+	    }
+	  if (val == 0)
+	    {
+	      /* Default one.  */
+	      selected_thread = get_teb ();
+	      selected_id = 0;
+	    }
+	  else if (!has_threads)
+	    {
+	      packet_error (0);
+	      return 0;
+	    }
+	  else
+	    {
+	      res = pthread_debug_thd_get_info_addr ((pthread_t) val, &info);
+	      if (res != 0)
+		{
+		  TERM_FAO ("qThreadExtraInfo (!XH) failed: !SL!/", val, res);
+		  packet_error (0);
+		  return 0;
+		}
+	      selected_thread = info.teb;
+	      selected_id = info.sequence;
+	    }
+	  packet_ok ();
+	  break;
+	}
+      else if (pkt[1] == 'c'
+	       && ((pkt[2] == '-' && pkt[3] == '1' && len == 4)
+		   || (pkt[2] == '0' && len == 3)))
+	{
+	  /* Silently accept 'Hc0' and 'Hc-1'.  */
+	  packet_ok ();
+	  break;
+	}
+      else
+	{
+	  packet_error (0);
+	  return 0;
+	}
     case 'k':
-        SYS$EXIT (SS$_NORMAL);
-        break;
+      SYS$EXIT (SS$_NORMAL);
+      break;
     case 'm':
-        return handle_memory_read(pkt, &pos);
+      {
+	unsigned __int64 addr;
+	unsigned __int64 paddr;
+	unsigned int l;
+	unsigned int i;
+
+	addr = pkt2val (pkt, &pos);
+	if (pkt[pos] != ',')
+	  {
+	    packet_error (0);
+	    return 0;
+	  }
+	pos++;
+	l = pkt2val (pkt, &pos);
+	if (pkt[pos] != '#')
+	  {
+	    packet_error (0);
+	    return 0;
+	  }
+
+	/* Check access.  */
+	i = l + (addr & VMS_PAGE_MASK);
+	paddr = addr & ~VMS_PAGE_MASK;
+	while (1)
+	  {
+	    if (__prober (paddr, 0) != 1)
+	      {
+		packet_error (2);
+		return 0;
+	      }
+	    if (i < VMS_PAGE_SIZE)
+	      break;
+	    i -= VMS_PAGE_SIZE;
+	    paddr += VMS_PAGE_SIZE;
+	  }
+
+	/* Transfer.  */
+	for (i = 0; i < l; i++)
+	  byte2hex (gdb_buf + 1 + 2 * i, ((unsigned char *)addr)[i]);
+	gdb_blen += 2 * l;
+      }
+      break;
     case 'M':
-        return handle_memory_write(pkt, &pos);
+      {
+	unsigned __int64 addr;
+	unsigned __int64 paddr;
+	unsigned int l;
+	unsigned int i;
+	unsigned int oldprot;
+
+	addr = pkt2val (pkt, &pos);
+	if (pkt[pos] != ',')
+	  {
+	    packet_error (0);
+	    return 0;
+	  }
+	pos++;
+	l = pkt2val (pkt, &pos);
+	if (pkt[pos] != ':')
+	  {
+	    packet_error (0);
+	    return 0;
+	  }
+	pos++;
+	page_set_rw (addr, l, &oldprot);
+
+	/* Check access.  */
+	i = l + (addr & VMS_PAGE_MASK);
+	paddr = addr & ~VMS_PAGE_MASK;
+	while (1)
+	  {
+	    if (__probew (paddr, 0) != 1)
+	      {
+		page_restore_rw (addr, l, oldprot);
+		return 0;
+	      }
+	    if (i < VMS_PAGE_SIZE)
+	      break;
+	    i -= VMS_PAGE_SIZE;
+	    paddr += VMS_PAGE_SIZE;
+	  }
+
+	/* Write.  */
+	for (i = 0; i < l; i++)
+	  {
+	    int v = hex2byte (pkt + pos);
+	    pos += 2;
+	    ((unsigned char *)addr)[i] = v;
+	  }
+
+	/* Sync caches.  */
+	for (i = 0; i < l; i += 15)
+	  __fc (addr + i);
+	__fc (addr + l);
+
+	page_restore_rw (addr, l, oldprot);
+	packet_ok ();
+      }
+      break;
     case 'p':
-        return handle_register_packet(pkt, &pos, len);
+      {
+	unsigned int num = 0;
+	unsigned int i;
+	struct ia64_all_regs *regs = get_selected_regs ();
+
+	num = pkt2val (pkt, &pos);
+	if (pos != len)
+	  {
+	    packet_error (0);
+	    return 0;
+	  }
+
+	switch (num)
+	  {
+	  case IA64_IP_REGNUM:
+	    ireg2pkt (regs->ip.b);
+	    break;
+	  case IA64_BR0_REGNUM:
+	    ireg2pkt (regs->br[0].b);
+	    break;
+	  case IA64_PSR_REGNUM:
+	    ireg2pkt (regs->psr.b);
+	    break;
+	  case IA64_BSP_REGNUM:
+	    ireg2pkt (regs->bsp.b);
+	    break;
+	  case IA64_CFM_REGNUM:
+	    ireg2pkt (regs->cfm.b);
+	    break;
+	  case IA64_PFS_REGNUM:
+	    ireg2pkt (regs->pfs.b);
+	    break;
+	  case IA64_PR_REGNUM:
+	    ireg2pkt (regs->pr.b);
+	    break;
+	  default:
+	    TERM_FAO ("gdbserv: unhandled reg !UW!/", num);
+	    packet_error (0);
+	    return 0;
+	  }
+      }
+      break;
     case 'q':
-        handle_q_packet (pkt, len);
-        break;
+      handle_q_packet (pkt, len);
+      break;
     case 's':
-        return handle_step(len);
+      if (len == 1)
+	{
+	  /* Set psr.ss.  */
+	  excp_regs.psr.v |= (unsigned __int64)PSR$M_SS;
+	  return 1;
+	}
+      else
+	packet_error (0);
+      break;
     case 'T':
-        return handle_thread_status(pkt, &pos, len);
+      /* Thread status.  */
+      if (!has_threads)
+	{
+	  packet_ok ();
+	  break;
+	}
+      else
+	{
+	  int res;
+	  unsigned __int64 val;
+	  unsigned int fthr, thr;
+	  
+	  val = pkt2val (pkt, &pos);
+	  /* Default is error (but only after parsing is complete).  */
+	  packet_error (0);
+	  if (pos != len)
+	    break;
+
+	  /* Follow the list.  This makes a O(n2) algorithm, but we don't really
+	     have the choice.  Note that pthread_debug_thd_get_info_addr
+	     doesn't look reliable.  */
+	  fthr = thread_next (0);
+	  thr = fthr;
+	  do
+	    {
+	      if (val == thr)
+		{
+		  packet_ok ();
+		  break;
+		}
+	      thr = thread_next (thr);
+	    }
+	  while (thr != fthr);
+	}
+      break;
     case 'v':
-        return handle_v_packet (pkt, len);
+      return handle_v_packet (pkt, len);
+      break;
     case 'V':
-        return handle_VMS_extension(pkt, len);
+      if (len > 3 && pkt[1] == 'M' && pkt[2] == 'S' && pkt[3] == ' ')
+	{
+	  /* Temporary extension.  */
+	  if (has_threads)
+	    {
+	      pkt[len] = 0;
+	      stub_pthread_debug_cmd ((char *)pkt + 4);
+	      packet_ok ();
+	    }
+	  else
+	    packet_error (0);
+	}
+      break;
     default:
-        if (trace_pkt) {
-            term_puts ("unknown <: ");
-            term_write ((char *)pkt, len);
-            term_putnl ();
-        }
-        break;
+      if (trace_pkt)
+	{
+	  term_puts ("unknown <: ");
+	  term_write ((char *)pkt, len);
+	  term_putnl ();
+	}
+      break;
     }
-    return 0;
+  return 0;
 }
 
 /* Raw write to gdb.  */
@@ -2046,14 +1905,15 @@ sock_write (const unsigned char *buf, int len)
   struct _iosb iosb;
   unsigned int status;
 
-  status = sys$qiow (EFN$C_ENF,
-		     conn_channel,
-		     IO$_WRITEVBLK,
-		     &iosb,
-		     0,
-		     0,
-		     (char *)buf,
-		     len,
+  /* Write data to connection.  */
+  status = sys$qiow (EFN$C_ENF,           /* Event flag.  */
+		     conn_channel,        /* I/O channel.  */
+		     IO$_WRITEVBLK,       /* I/O function code.  */
+		     &iosb,               /* I/O status block.  */
+		     0,                   /* Ast service routine.  */
+		     0,                   /* Ast parameter.  */
+		     (char *)buf,         /* P1 - buffer address.  */
+		     len,                 /* P2 - buffer length.  */
 		     0, 0, 0, 0);
   if (status & STS$M_SUCCESS)
     status = iosb.iosb$w_status;
@@ -2066,916 +1926,663 @@ sock_write (const unsigned char *buf, int len)
 
 /* Compute the checksum and send the packet.  */
 
-static void calculate_checksum(unsigned char *checksum)
+static void
+send_pkt (void)
 {
-    unsigned int i;
-    *checksum = 0;
-    for (i = 1; i < gdb_blen; i++)
-        *checksum += gdb_buf[i];
-}
+  unsigned char chksum = 0;
+  unsigned int i;
 
-static void append_checksum_to_buffer(unsigned char checksum)
-{
-    gdb_buf[gdb_blen] = '#';
-    byte2hex(gdb_buf + gdb_blen + 1, checksum);
-}
+  for (i = 1; i < gdb_blen; i++)
+    chksum += gdb_buf[i];
 
-static void write_packet_to_socket(void)
-{
-    const unsigned int packet_size = gdb_blen + 3;
-    sock_write(gdb_buf, packet_size);
-}
+  gdb_buf[gdb_blen] = '#';
+  byte2hex (gdb_buf + gdb_blen + 1, chksum);
 
-static void trace_packet_if_enabled(void)
-{
-    const unsigned int packet_size = gdb_blen + 3;
-    const int TRACE_LEVEL_VERBOSE = 1;
-    
-    if (trace_pkt > TRACE_LEVEL_VERBOSE)
+  sock_write (gdb_buf, gdb_blen + 3);
+
+  if (trace_pkt > 1)
     {
-        term_puts(">: ");
-        term_write((char *)gdb_buf, packet_size);
-        term_putnl();
+      term_puts (">: ");
+      term_write ((char *)gdb_buf, gdb_blen + 3);
+      term_putnl ();
     }
-}
-
-static void send_pkt(void)
-{
-    unsigned char chksum;
-    
-    calculate_checksum(&chksum);
-    append_checksum_to_buffer(chksum);
-    write_packet_to_socket();
-    trace_packet_if_enabled();
 }
 
 /* Read and handle one command.  Return 1 is execution must resume.  */
 
-static int read_data_from_connection(unsigned int off)
+static int
+one_command (void)
 {
-    struct _iosb iosb;
-    unsigned int status;
-    
-    status = sys$qiow(EFN$C_ENF,
-                      conn_channel,
-                      IO$_READVBLK,
-                      &iosb,
-                      0,
-                      0,
-                      gdb_buf + off,
-                      sizeof(gdb_buf) - off,
-                      0, 0, 0, 0);
-    
-    if (status & STS$M_SUCCESS)
-        status = iosb.iosb$w_status;
-    
-    if (!(status & STS$M_SUCCESS))
+  struct _iosb iosb;
+  unsigned int status;
+  unsigned int off;
+  unsigned int dollar_off = 0;
+  unsigned int sharp_off = 0;
+  unsigned int cmd_off;
+  unsigned int cmd_len;
+
+  /* Wait for a packet.  */
+  while (1)
     {
-        term_puts("Failed to read data from connection\n");
-        LIB$SIGNAL(status);
-    }
-    
+      off = 0;
+      while (1)
+	{
+	  /* Read data from connection.  */
+	  status = sys$qiow (EFN$C_ENF,           /* Event flag.  */
+			     conn_channel,        /* I/O channel.  */
+			     IO$_READVBLK,        /* I/O function code.  */
+			     &iosb,               /* I/O status block.  */
+			     0,                   /* Ast service routine.  */
+			     0,                   /* Ast parameter.  */
+			     gdb_buf + off,       /* P1 - buffer address.  */
+			     sizeof (gdb_buf) - off, /* P2 - buffer leng.  */
+			     0, 0, 0, 0);
+	  if (status & STS$M_SUCCESS)
+	    status = iosb.iosb$w_status;
+	  if (!(status & STS$M_SUCCESS))
+	    {
+	      term_puts ("Failed to read data from connection\n" );
+	      LIB$SIGNAL (status);
+	    }
+
 #ifdef RAW_DUMP
-    term_puts("{: ");
-    term_write((char *)gdb_buf + off, iosb.iosb$w_bcnt);
-    term_putnl();
+	  term_puts ("{: ");
+	  term_write ((char *)gdb_buf + off, iosb.iosb$w_bcnt);
+	  term_putnl ();
 #endif
-    
-    return iosb.iosb$w_bcnt;
-}
 
-static unsigned int find_character(unsigned int start, unsigned int end, char target)
-{
-    unsigned int i;
-    for (i = start; i < end; i++)
-        if (gdb_buf[i] == target)
-            return i;
-    return end;
-}
+	  gdb_blen = off + iosb.iosb$w_bcnt;
 
-static int validate_checksum(unsigned int dollar_off, unsigned int sharp_off)
-{
-    unsigned char chksum = 0;
-    unsigned int i;
-    int v;
-    
-    for (i = dollar_off + 1; i < sharp_off; i++)
-        chksum += gdb_buf[i];
-    
-    v = hex2byte(gdb_buf + sharp_off + 1);
-    
-    if (v != chksum)
-    {
-        term_puts("Discard bad checksum packet\n");
-        return 0;
+	  if (off == 0)
+	    {
+	      /* Search for '$'.  */
+	      for (dollar_off = 0; dollar_off < gdb_blen; dollar_off++)
+		if (gdb_buf[dollar_off] == '$')
+		  break;
+	      if (dollar_off >= gdb_blen)
+		{
+		  /* Not found, discard the data.  */
+		  off = 0;
+		  continue;
+		}
+	      /* Search for '#'.  */
+	      for (sharp_off = dollar_off + 1;
+		   sharp_off < gdb_blen;
+		   sharp_off++)
+		if (gdb_buf[sharp_off] == '#')
+		  break;
+	    }
+	  else if (sharp_off >= off)
+	    {
+	      /* Search for '#'.  */
+	      for (; sharp_off < gdb_blen; sharp_off++)
+		if (gdb_buf[sharp_off] == '#')
+		  break;
+	    }
+
+	  /* Got packet with checksum.  */
+	  if (sharp_off + 2 <= gdb_blen)
+	    break;
+
+	  off = gdb_blen;
+	  if (gdb_blen == sizeof (gdb_buf))
+	    {
+	      /* Packet too large, discard.  */
+	      off = 0;
+	    }
+	}
+
+      /* Validate and acknowledge a packet.  */
+      {
+	unsigned char chksum = 0;
+	unsigned int i;
+	int v;
+
+	for (i = dollar_off + 1; i < sharp_off; i++)
+	  chksum += gdb_buf[i];
+	v = hex2byte (gdb_buf + sharp_off + 1);
+	if (v != chksum)
+	  {
+	    term_puts ("Discard bad checksum packet\n");
+	    continue;
+	  }
+	else
+	  {
+	    sock_write ((const unsigned char *)"+", 1);
+	    break;
+	  }
+      }
     }
-    
-    sock_write((const unsigned char *)"+", 1);
+
+  if (trace_pkt > 1)
+    {
+      term_puts ("<: ");
+      term_write ((char *)gdb_buf + dollar_off, sharp_off - dollar_off + 1);
+      term_putnl ();
+    }
+
+  cmd_off = dollar_off + 1;
+  cmd_len = sharp_off - dollar_off - 1;
+
+  if (handle_packet (gdb_buf + dollar_off + 1, sharp_off - dollar_off - 1) == 1)
     return 1;
-}
 
-static int read_complete_packet(unsigned int *dollar_off, unsigned int *sharp_off)
-{
-    unsigned int off = 0;
-    unsigned int bytes_read;
-    
-    while (1)
-    {
-        bytes_read = read_data_from_connection(off);
-        gdb_blen = off + bytes_read;
-        
-        if (off == 0)
-        {
-            *dollar_off = find_character(0, gdb_blen, '$');
-            if (*dollar_off >= gdb_blen)
-            {
-                off = 0;
-                continue;
-            }
-            *sharp_off = find_character(*dollar_off + 1, gdb_blen, '#');
-        }
-        else if (*sharp_off >= off)
-        {
-            *sharp_off = find_character(*sharp_off, gdb_blen, '#');
-        }
-        
-        if (*sharp_off + 2 <= gdb_blen)
-            break;
-        
-        off = gdb_blen;
-        if (gdb_blen == sizeof(gdb_buf))
-            off = 0;
-    }
-    
-    return 1;
-}
-
-static void trace_packet(unsigned int dollar_off, unsigned int sharp_off)
-{
-    if (trace_pkt > 1)
-    {
-        term_puts("<: ");
-        term_write((char *)gdb_buf + dollar_off, sharp_off - dollar_off + 1);
-        term_putnl();
-    }
-}
-
-static int one_command(void)
-{
-    unsigned int dollar_off = 0;
-    unsigned int sharp_off = 0;
-    unsigned int cmd_off;
-    unsigned int cmd_len;
-    
-    while (1)
-    {
-        read_complete_packet(&dollar_off, &sharp_off);
-        
-        if (validate_checksum(dollar_off, sharp_off))
-            break;
-    }
-    
-    trace_packet(dollar_off, sharp_off);
-    
-    cmd_off = dollar_off + 1;
-    cmd_len = sharp_off - dollar_off - 1;
-    
-    if (handle_packet(gdb_buf + cmd_off, cmd_len) == 1)
-        return 1;
-    
-    send_pkt();
-    return 0;
+  send_pkt ();
+  return 0;
 }
 
 /* Display the condition given by SIG64.  */
 
-static void get_exception_message(struct chf64$signal_array *sig64, char *msg2, unsigned short *msg2len)
+static void
+display_excp (struct chf64$signal_array *sig64, struct chf$mech_array *mech)
 {
-    unsigned int status;
-    char msg[160];
-    unsigned short msglen;
-    $DESCRIPTOR (msg_desc, msg);
-    unsigned char outadr[4];
-    struct dsc$descriptor_s msg2_desc = { 160, DSC$K_DTYPE_T, DSC$K_CLASS_S, msg2};
+  unsigned int status;
+  char msg[160];
+  unsigned short msglen;
+  $DESCRIPTOR (msg_desc, msg);
+  unsigned char outadr[4];
 
-    status = SYS$GETMSG (sig64->chf64$q_sig_name, &msglen, &msg_desc, 0, outadr);
-    if (!(status & STS$M_SUCCESS))
+  status = SYS$GETMSG (sig64->chf64$q_sig_name, &msglen, &msg_desc, 0, outadr);
+  if (status & STS$M_SUCCESS)
     {
-        *msg2len = 0;
-        return;
+      char msg2[160];
+      unsigned short msg2len;
+      struct dsc$descriptor_s msg2_desc =
+	{ sizeof (msg2), DSC$K_DTYPE_T, DSC$K_CLASS_S, msg2};
+      msg_desc.dsc$w_length = msglen;
+      status = SYS$FAOL_64 (&msg_desc, &msg2len, &msg2_desc,
+			    &sig64->chf64$q_sig_arg1);
+      if (status & STS$M_SUCCESS)
+	term_write (msg2, msg2len);
     }
+  else
+    term_puts ("no message");
+  term_putnl ();
 
-    msg_desc.dsc$w_length = msglen;
-    status = SYS$FAOL_64 (&msg_desc, msg2len, &msg2_desc, &sig64->chf64$q_sig_arg1);
-    if (!(status & STS$M_SUCCESS))
+  if (trace_excp > 1)
     {
-        *msg2len = 0;
+      TERM_FAO (" Frame: !XH, Depth: !4SL, Esf: !XH!/",
+		mech->chf$q_mch_frame, mech->chf$q_mch_depth,
+		mech->chf$q_mch_esf_addr);
     }
-}
-
-static void display_message(char *msg2, unsigned short msg2len)
-{
-    if (msg2len > 0)
-    {
-        term_write (msg2, msg2len);
-    }
-    else
-    {
-        term_puts ("no message");
-    }
-    term_putnl ();
-}
-
-static void display_trace_info(struct chf$mech_array *mech)
-{
-    if (trace_excp > 1)
-    {
-        TERM_FAO (" Frame: !XH, Depth: !4SL, Esf: !XH!/",
-                  mech->chf$q_mch_frame, mech->chf$q_mch_depth,
-                  mech->chf$q_mch_esf_addr);
-    }
-}
-
-static void display_excp (struct chf64$signal_array *sig64, struct chf$mech_array *mech)
-{
-    char msg2[160];
-    unsigned short msg2len;
-
-    get_exception_message(sig64, msg2, &msg2len);
-    display_message(msg2, msg2len);
-    display_trace_info(mech);
 }
 
 /* Get all registers from current thread.  */
 
-static unsigned __int64 get_program_counter(struct chf64$signal_array *sig64)
+static void
+read_all_registers (struct chf$mech_array *mech)
 {
+  struct _intstk *intstk =
+    (struct _intstk *)mech->chf$q_mch_esf_addr;
+  struct chf64$signal_array *sig64 =
+    (struct chf64$signal_array *)mech->chf$ph_mch_sig64_addr;
   unsigned int cnt = sig64->chf64$w_sig_arg_count;
-  return (&sig64->chf64$q_sig_name)[cnt - 2];
-}
+  unsigned __int64 pc = (&sig64->chf64$q_sig_name)[cnt - 2];
 
-static unsigned __int64 calculate_adjusted_bsp(struct _intstk *intstk)
-{
-  unsigned __int64 bsp = intstk->intstk$q_bsp;
-  unsigned int sof = intstk->intstk$q_ifs & 0x7f;
-  unsigned int delta = ((bsp >> 3) & 0x3f) + sof;
-  return bsp + ((sof + delta / 0x3f) << 3);
-}
-
-static void set_general_register(int index, unsigned __int64 value)
-{
-  excp_regs.gr[index].v = value;
-}
-
-static void set_branch_register(int index, unsigned __int64 value)
-{
-  excp_regs.br[index].v = value;
-}
-
-static void load_special_registers(struct _intstk *intstk, unsigned __int64 pc)
-{
-  #define IFS_MASK 0x3fffffffff
-  
   excp_regs.ip.v = pc;
   excp_regs.psr.v = intstk->intstk$q_ipsr;
-  excp_regs.bsp.v = calculate_adjusted_bsp(intstk);
-  excp_regs.cfm.v = intstk->intstk$q_ifs & IFS_MASK;
+  /* GDB and linux expects bsp to point after the current register frame.
+     Adjust.  */
+  {
+    unsigned __int64 bsp = intstk->intstk$q_bsp;
+    unsigned int sof = intstk->intstk$q_ifs & 0x7f;
+    unsigned int delta = ((bsp >> 3) & 0x3f) + sof;
+    excp_regs.bsp.v = bsp + ((sof + delta / 0x3f) << 3);
+  }
+  excp_regs.cfm.v = intstk->intstk$q_ifs & 0x3fffffffff;
   excp_regs.pfs.v = intstk->intstk$q_pfs;
   excp_regs.pr.v = intstk->intstk$q_preds;
-}
-
-static void load_general_registers(struct _intstk *intstk)
-{
-  unsigned __int64 *reg_values[] = {
-    NULL,
-    &intstk->intstk$q_gp,
-    &intstk->intstk$q_r2,
-    &intstk->intstk$q_r3,
-    &intstk->intstk$q_r4,
-    &intstk->intstk$q_r5,
-    &intstk->intstk$q_r6,
-    &intstk->intstk$q_r7,
-    &intstk->intstk$q_r8,
-    &intstk->intstk$q_r9,
-    &intstk->intstk$q_r10,
-    &intstk->intstk$q_r11,
-    NULL,
-    &intstk->intstk$q_r13,
-    &intstk->intstk$q_r14,
-    &intstk->intstk$q_r15,
-    &intstk->intstk$q_r16,
-    &intstk->intstk$q_r17,
-    &intstk->intstk$q_r18,
-    &intstk->intstk$q_r19,
-    &intstk->intstk$q_r20,
-    &intstk->intstk$q_r21,
-    &intstk->intstk$q_r22,
-    &intstk->intstk$q_r23,
-    &intstk->intstk$q_r24,
-    &intstk->intstk$q_r25,
-    &intstk->intstk$q_r26,
-    &intstk->intstk$q_r27,
-    &intstk->intstk$q_r28,
-    &intstk->intstk$q_r29,
-    &intstk->intstk$q_r30,
-    &intstk->intstk$q_r31
-  };
-  
-  set_general_register(0, 0);
-  
-  for (int i = 1; i < 32; i++) {
-    if (i == 12) {
-      set_general_register(12, (unsigned __int64)intstk + intstk->intstk$l_stkalign);
-    } else if (reg_values[i] != NULL) {
-      set_general_register(i, *reg_values[i]);
-    }
-  }
-}
-
-static void load_branch_registers(struct _intstk *intstk)
-{
-  unsigned __int64 *br_values[] = {
-    &intstk->intstk$q_b0,
-    &intstk->intstk$q_b1,
-    &intstk->intstk$q_b2,
-    &intstk->intstk$q_b3,
-    &intstk->intstk$q_b4,
-    &intstk->intstk$q_b5,
-    &intstk->intstk$q_b6,
-    &intstk->intstk$q_b7
-  };
-  
-  for (int i = 0; i < 8; i++) {
-    set_branch_register(i, *br_values[i]);
-  }
-}
-
-static void read_all_registers(struct chf$mech_array *mech)
-{
-  struct _intstk *intstk = (struct _intstk *)mech->chf$q_mch_esf_addr;
-  struct chf64$signal_array *sig64 = (struct chf64$signal_array *)mech->chf$ph_mch_sig64_addr;
-  
-  unsigned __int64 pc = get_program_counter(sig64);
-  
-  load_special_registers(intstk, pc);
-  load_general_registers(intstk);
-  load_branch_registers(intstk);
+  excp_regs.gr[0].v = 0;
+  excp_regs.gr[1].v = intstk->intstk$q_gp;
+  excp_regs.gr[2].v = intstk->intstk$q_r2;
+  excp_regs.gr[3].v = intstk->intstk$q_r3;
+  excp_regs.gr[4].v = intstk->intstk$q_r4;
+  excp_regs.gr[5].v = intstk->intstk$q_r5;
+  excp_regs.gr[6].v = intstk->intstk$q_r6;
+  excp_regs.gr[7].v = intstk->intstk$q_r7;
+  excp_regs.gr[8].v = intstk->intstk$q_r8;
+  excp_regs.gr[9].v = intstk->intstk$q_r9;
+  excp_regs.gr[10].v = intstk->intstk$q_r10;
+  excp_regs.gr[11].v = intstk->intstk$q_r11;
+  excp_regs.gr[12].v = (unsigned __int64)intstk + intstk->intstk$l_stkalign;
+  excp_regs.gr[13].v = intstk->intstk$q_r13;
+  excp_regs.gr[14].v = intstk->intstk$q_r14;
+  excp_regs.gr[15].v = intstk->intstk$q_r15;
+  excp_regs.gr[16].v = intstk->intstk$q_r16;
+  excp_regs.gr[17].v = intstk->intstk$q_r17;
+  excp_regs.gr[18].v = intstk->intstk$q_r18;
+  excp_regs.gr[19].v = intstk->intstk$q_r19;
+  excp_regs.gr[20].v = intstk->intstk$q_r20;
+  excp_regs.gr[21].v = intstk->intstk$q_r21;
+  excp_regs.gr[22].v = intstk->intstk$q_r22;
+  excp_regs.gr[23].v = intstk->intstk$q_r23;
+  excp_regs.gr[24].v = intstk->intstk$q_r24;
+  excp_regs.gr[25].v = intstk->intstk$q_r25;
+  excp_regs.gr[26].v = intstk->intstk$q_r26;
+  excp_regs.gr[27].v = intstk->intstk$q_r27;
+  excp_regs.gr[28].v = intstk->intstk$q_r28;
+  excp_regs.gr[29].v = intstk->intstk$q_r29;
+  excp_regs.gr[30].v = intstk->intstk$q_r30;
+  excp_regs.gr[31].v = intstk->intstk$q_r31;
+  excp_regs.br[0].v = intstk->intstk$q_b0;
+  excp_regs.br[1].v = intstk->intstk$q_b1;
+  excp_regs.br[2].v = intstk->intstk$q_b2;
+  excp_regs.br[3].v = intstk->intstk$q_b3;
+  excp_regs.br[4].v = intstk->intstk$q_b4;
+  excp_regs.br[5].v = intstk->intstk$q_b5;
+  excp_regs.br[6].v = intstk->intstk$q_b6;
+  excp_regs.br[7].v = intstk->intstk$q_b7;
 }
 
 /* Write all registers to current thread.  FIXME: not yet complete.  */
 
-static void write_all_registers(struct chf$mech_array *mech)
+static void
+write_all_registers (struct chf$mech_array *mech)
 {
-    struct _intstk *intstk = (struct _intstk *)mech->chf$q_mch_esf_addr;
-    intstk->intstk$q_ipsr = excp_regs.psr.v;
+  struct _intstk *intstk =
+    (struct _intstk *)mech->chf$q_mch_esf_addr;
+
+  intstk->intstk$q_ipsr = excp_regs.psr.v;
 }
 
 /* Do debugging.  Report status to gdb and execute commands.  */
 
-static unsigned int disable_ast(void)
+static void
+do_debug (struct chf$mech_array *mech)
 {
-    unsigned int status = sys$setast(0);
-    
-    if (status == SS$_WASCLR)
-        return 0;
-    if (status == SS$_WASSET)
-        return 1;
-    
-    lib$signal(status);
-    return 0;
-}
+  struct _intstk *intstk =
+    (struct _intstk *)mech->chf$q_mch_esf_addr;
+  unsigned int old_ast;
+  unsigned int old_sch;
+  unsigned int status;
 
-static void restore_ast(unsigned int old_ast)
-{
-    unsigned int status = sys$setast(old_ast);
-    if (!(status & STS$M_SUCCESS))
-        LIB$SIGNAL(status);
-}
+  /* Disable ast.  */
+  status = sys$setast (0);
+  switch (status)
+    {
+    case SS$_WASCLR:
+      old_ast = 0;
+      break;
+    case SS$_WASSET:
+      old_ast = 1;
+      break;
+    default:
+      /* Should never happen!  */
+      lib$signal (status);
+    }
 
-static unsigned int disable_thread_scheduling_if_needed(void)
-{
-    if (!has_threads)
-        return 0;
-    return set_thread_scheduling(0);
-}
+  /* Disable thread scheduling.  */
+  if (has_threads)
+    old_sch = set_thread_scheduling (0);
 
-static void restore_thread_scheduling_if_needed(unsigned int old_sch)
-{
-    if (!has_threads)
-        return;
-    set_thread_scheduling(old_sch);
-}
+  read_all_registers (mech);
 
-static void send_stop_reply(void)
-{
-    packet_status();
-    send_pkt();
-}
+  /* Send stop reply packet.  */
+  packet_status ();
+  send_pkt ();
 
-static void process_commands(void)
-{
-    while (one_command() == 0)
-        ;
-}
+  while (one_command () == 0)
+    ;
 
-static void do_debug(struct chf$mech_array *mech)
-{
-    struct _intstk *intstk = (struct _intstk *)mech->chf$q_mch_esf_addr;
-    unsigned int old_ast = disable_ast();
-    unsigned int old_sch = disable_thread_scheduling_if_needed();
-    
-    read_all_registers(mech);
-    send_stop_reply();
-    process_commands();
-    write_all_registers(mech);
-    
-    restore_thread_scheduling_if_needed(old_sch);
-    restore_ast(old_ast);
+  write_all_registers (mech);
+
+  /* Re-enable scheduling.  */
+  if (has_threads)
+    set_thread_scheduling (old_sch);
+
+  /* Re-enable AST.  */
+  status = sys$setast (old_ast);
+  if (!(status & STS$M_SUCCESS))
+    LIB$SIGNAL (status);
 }
 
 /* The condition handler.  That's the core of the stub.  */
 
-static int in_handler = 0;
-
-#define CODE_MASK (STS$M_COND_ID)
-#define BREAK_CODE (SS$_BREAK & CODE_MASK)
-#define ACCVIO_CODE (SS$_ACCVIO & CODE_MASK)
-#define OPCDEC_CODE (SS$_OPCDEC & CODE_MASK)
-#define TBIT_CODE (SS$_TBIT & CODE_MASK)
-#define DEBUG_CODE (SS$_DEBUG & CODE_MASK)
-#define KEYNOTFOU_CODE (LIB$_KEYNOTFOU & CODE_MASK)
-
-#define RECURSION_LIMIT 1
-#define FATAL_RECURSION 2
-#define ENTRY_BUNDLE_SIZE 16
-
-static unsigned __int64 get_pc_from_signal(struct chf64$signal_array *sig64)
+static int
+excp_handler (struct chf$signal_array *sig,
+	      struct chf$mech_array *mech)
 {
+  struct chf64$signal_array *sig64 =
+    (struct chf64$signal_array *)mech->chf$ph_mch_sig64_addr;
+  unsigned int code = sig->chf$l_sig_name & STS$M_COND_ID;
   unsigned int cnt = sig64->chf64$w_sig_arg_count;
-  return (&sig64->chf64$q_sig_name)[cnt - 2];
-}
-
-static int should_ignore_condition(unsigned int code)
-{
-  return (code == KEYNOTFOU_CODE);
-}
-
-static void handle_recursion(struct chf64$signal_array *sig64, struct chf$signal_array *sig)
-{
-  unsigned __int64 pc = get_pc_from_signal(sig64);
-  if (in_handler == FATAL_RECURSION)
-    TERM_FAO ("gdbstub: exception in handler (pc=!XH)!!!/", pc);
-  sys$exit (sig->chf$l_sig_name);
-}
-
-static void restore_entry_bundle(void)
-{
-  static unsigned int entry_prot;
-  
-  if (trace_entry)
-    term_puts ("initial entry breakpoint\n");
-  
-  page_set_rw (entry_pc, ENTRY_BUNDLE_SIZE, &entry_prot);
-  ots$move ((void *)entry_pc, ENTRY_BUNDLE_SIZE, entry_saved);
-  __fc (entry_pc);
-  page_restore_rw (entry_pc, ENTRY_BUNDLE_SIZE, entry_prot);
-}
-
-static int is_entry_breakpoint(unsigned int code, unsigned __int64 pc)
-{
-  return (code == BREAK_CODE && pc == entry_pc && entry_pc != 0);
-}
-
-static void display_debug_info(struct chf64$signal_array *sig64, struct chf$mech_array *mech)
-{
-  int i;
-  unsigned int cnt = sig64->chf64$w_sig_arg_count;
-  struct _intstk *intstk = (struct _intstk *)mech->chf$q_mch_esf_addr;
-  
-  display_excp (sig64, mech);
-  TERM_FAO (" intstk: !XH!/", intstk);
-  
-  for (i = 0; i < cnt + 1; i++)
-    TERM_FAO ("   !XH!/", ((unsigned __int64 *)sig64)[i]);
-}
-
-static int is_debug_exception(unsigned int code)
-{
-  return (code == ACCVIO_CODE || 
-          code == BREAK_CODE || 
-          code == OPCDEC_CODE || 
-          code == TBIT_CODE || 
-          code == DEBUG_CODE);
-}
-
-static int handle_debug_exception(unsigned int code, struct chf64$signal_array *sig64, 
-                                  struct chf$mech_array *mech)
-{
-  if (code == ACCVIO_CODE && trace_excp <= 1)
-    display_excp (sig64, mech);
-  
-  if (trace_excp > 1)
-    display_debug_info(sig64, mech);
-  
-  do_debug (mech);
-  return SS$_CONTINUE_64;
-}
-
-static int excp_handler (struct chf$signal_array *sig, struct chf$mech_array *mech)
-{
-  struct chf64$signal_array *sig64 = (struct chf64$signal_array *)mech->chf$ph_mch_sig64_addr;
-  unsigned int code = sig->chf$l_sig_name & CODE_MASK;
   unsigned __int64 pc;
   unsigned int ret;
-  
-  if (should_ignore_condition(code))
-    return SS$_RESIGNAL_64;
-  
+  /* Self protection.  FIXME: Should be per thread ?  */
+  static int in_handler = 0;
+
+  /* Completely ignore some conditions (signaled indirectly by this stub).  */
+  switch (code)
+    {
+    case LIB$_KEYNOTFOU & STS$M_COND_ID:
+      return SS$_RESIGNAL_64;
+    default:
+      break;
+    }
+
+  /* Protect against recursion.  */
   in_handler++;
-  if (in_handler > RECURSION_LIMIT)
-    handle_recursion(sig64, sig);
-  
-  pc = get_pc_from_signal(sig64);
-  
+  if (in_handler > 1)
+    {
+      if (in_handler == 2)
+	TERM_FAO ("gdbstub: exception in handler (pc=!XH)!!!/",
+		  (&sig64->chf64$q_sig_name)[cnt - 2]);
+      sys$exit (sig->chf$l_sig_name);
+    }
+
+  pc = (&sig64->chf64$q_sig_name)[cnt - 2];
   if (trace_excp)
     TERM_FAO ("excp_handler: code: !XL, pc=!XH!/", code, pc);
-  
-  if (is_entry_breakpoint(code, pc))
-    restore_entry_bundle();
-  
-  if (is_debug_exception(code))
-    ret = handle_debug_exception(code, sig64, mech);
-  else
+
+  /* If break on the entry point, restore the bundle.  */
+  if (code == (SS$_BREAK & STS$M_COND_ID)
+      && pc == entry_pc
+      && entry_pc != 0)
     {
+      static unsigned int entry_prot;
+
+      if (trace_entry)
+	term_puts ("initial entry breakpoint\n");
+      page_set_rw (entry_pc, 16, &entry_prot);
+
+      ots$move ((void *)entry_pc, 16, entry_saved);
+      __fc (entry_pc);
+      page_restore_rw (entry_pc, 16, entry_prot);
+    }
+
+  switch (code)
+    {
+    case SS$_ACCVIO & STS$M_COND_ID:
+      if (trace_excp <= 1)
+	display_excp (sig64, mech);
+      /* Fall through.  */
+    case SS$_BREAK  & STS$M_COND_ID:
+    case SS$_OPCDEC & STS$M_COND_ID:
+    case SS$_TBIT   & STS$M_COND_ID:
+    case SS$_DEBUG  & STS$M_COND_ID:
+      if (trace_excp > 1)
+	{
+	  int i;
+	  struct _intstk *intstk =
+	    (struct _intstk *)mech->chf$q_mch_esf_addr;
+
+	  display_excp (sig64, mech);
+
+	  TERM_FAO (" intstk: !XH!/", intstk);
+	  for (i = 0; i < cnt + 1; i++)
+	    TERM_FAO ("   !XH!/", ((unsigned __int64 *)sig64)[i]);
+	}
+      do_debug (mech);
+      ret = SS$_CONTINUE_64;
+      break;
+
+    default:
       display_excp (sig64, mech);
       ret = SS$_RESIGNAL_64;
+      break;
     }
-  
+
   in_handler--;
+  /* Discard selected thread registers.  */
   sel_regs_pthread = 0;
   return ret;
 }
 
 /* Setup internal trace flags according to GDBSTUB$TRACE logical.  */
 
-static void initialize_item_list(ILE3 *item_lst, char *resstring, unsigned short *len)
+static void
+trace_init (void)
 {
-    item_lst[0].ile3$w_length = LNM$C_NAMLENGTH;
-    item_lst[0].ile3$w_code = LNM$_STRING;
-    item_lst[0].ile3$ps_bufaddr = resstring;
-    item_lst[0].ile3$ps_retlen_addr = len;
-    item_lst[1].ile3$w_length = 0;
-    item_lst[1].ile3$w_code = 0;
-}
+  unsigned int status, i, start;
+  unsigned short len;
+  char resstring[LNM$C_NAMLENGTH];
+  static const $DESCRIPTOR (tabdesc, "LNM$DCL_LOGICAL");
+  static const $DESCRIPTOR (logdesc, "GDBSTUB$TRACE");
+  $DESCRIPTOR (sub_desc, resstring);
+  ILE3 item_lst[2];
 
-static unsigned int translate_logical_name(ILE3 *item_lst)
-{
-    static const $DESCRIPTOR (tabdesc, "LNM$DCL_LOGICAL");
-    static const $DESCRIPTOR (logdesc, "GDBSTUB$TRACE");
-    
-    return SYS$TRNLNM(0, (void *)&tabdesc, (void *)&logdesc, 0, item_lst);
-}
+  item_lst[0].ile3$w_length = LNM$C_NAMLENGTH;
+  item_lst[0].ile3$w_code = LNM$_STRING;
+  item_lst[0].ile3$ps_bufaddr = resstring;
+  item_lst[0].ile3$ps_retlen_addr = &len;
+  item_lst[1].ile3$w_length = 0;
+  item_lst[1].ile3$w_code = 0;
 
-static int is_delimiter(char c)
-{
-    return (c == ',' || c == ';');
-}
+  /* Translate the logical name.  */
+  status = SYS$TRNLNM (0,   		/* Attributes of the logical name.  */
+		       (void *)&tabdesc,       /* Logical name table.  */
+		       (void *)&logdesc,       /* Logical name.  */
+		       0,              	       /* Access mode.  */
+		       &item_lst);             /* Item list.  */
+  if (status == SS$_NOLOGNAM)
+    return;
+  if (!(status & STS$M_SUCCESS))
+    LIB$SIGNAL (status);
 
-static void process_directive(char *resstring, unsigned int start, unsigned int end)
-{
-    int j;
-    $DESCRIPTOR (sub_desc, resstring);
-    
-    sub_desc.dsc$a_pointer = resstring + start;
-    sub_desc.dsc$w_length = end - start;
-    
-    for (j = 0; j < NBR_DEBUG_FLAGS; j++)
+  start = 0;
+  for (i = 0; i <= len; i++)
     {
-        if (str$case_blind_compare(&sub_desc, (void *)&debug_flags[j].name) == 0)
-        {
-            debug_flags[j].val++;
-            return;
-        }
-    }
-    
-    TERM_FAO("GDBSTUB$TRACE: unknown directive !AS!/", &sub_desc);
-}
+      if ((i == len || resstring[i] == ',' || resstring[i] == ';')
+	  && i != start)
+	{
+	  int j;
 
-static void parse_directives(char *resstring, unsigned short len)
-{
-    unsigned int i, start = 0;
-    
-    for (i = 0; i <= len; i++)
-    {
-        if ((i == len || is_delimiter(resstring[i])) && i != start)
-        {
-            process_directive(resstring, start, i);
-            start = i + 1;
-        }
-    }
-}
+	  sub_desc.dsc$a_pointer = resstring + start;
+	  sub_desc.dsc$w_length = i - start;
 
-static void display_trace_info(char *resstring, unsigned short len)
-{
-    unsigned int i;
-    
-    TERM_FAO("GDBSTUB$TRACE=!AD ->", len, resstring);
-    
-    for (i = 0; i < NBR_DEBUG_FLAGS; i++)
-    {
-        if (debug_flags[i].val > 0)
-        {
-            TERM_FAO(" !AS=!ZL", &debug_flags[i].name, debug_flags[i].val);
-        }
-    }
-    
-    term_putnl();
-}
+	  for (j = 0; j < NBR_DEBUG_FLAGS; j++)
+	    if (str$case_blind_compare (&sub_desc, 
+					(void *)&debug_flags[j].name) == 0)
+	      {
+		debug_flags[j].val++;
+		break;
+	      }
+	  if (j == NBR_DEBUG_FLAGS)
+	    TERM_FAO ("GDBSTUB$TRACE: unknown directive !AS!/", &sub_desc);
 
-static void trace_init(void)
-{
-    unsigned int status;
-    unsigned short len;
-    char resstring[LNM$C_NAMLENGTH];
-    ILE3 item_lst[2];
-    
-    initialize_item_list(item_lst, resstring, &len);
-    status = translate_logical_name(item_lst);
-    
-    if (status == SS$_NOLOGNAM)
-    {
-        return;
+	  start = i + 1;
+	}
     }
-    
-    if (!(status & STS$M_SUCCESS))
-    {
-        LIB$SIGNAL(status);
-    }
-    
-    parse_directives(resstring, len);
-    display_trace_info(resstring, len);
+
+  TERM_FAO ("GDBSTUB$TRACE=!AD ->", len, resstring);
+  for (i = 0; i < NBR_DEBUG_FLAGS; i++)
+    if (debug_flags[i].val > 0)
+      TERM_FAO (" !AS=!ZL", &debug_flags[i].name, debug_flags[i].val);
+  term_putnl ();
 }
 
 
 /* Entry point.  */
 
-static int initialized;
-
-#define PTHREAD_RTL_NAME "pthread$rtl"
-#define INITBP_SIZE 16
-#define TRACE_SEGMENT_FLAGS 2
-#define FLAG_READ 0x04
-#define FLAG_WRITE 0x02
-#define FLAG_EXEC 0x01
-#define FLAG_PROT 0x01000000
-#define FLAG_SHORT 0x04000000
-#define FLAG_SHARED 0x08000000
-
-static void print_hello_banner(void)
+static int
+stub_start (unsigned __int64 *progxfer, void *cli_util,
+	    EIHD *imghdr, IFD *imgfile,
+	    unsigned int linkflag, unsigned int cliflag)
 {
-  term_puts ("Hello from gdb stub\n");
-}
-
-static int check_reentry(void)
-{
-  if (initialized)
-    {
-      term_puts ("gdbstub: re-entry\n");
-      return 1;
-    }
-  initialized = 1;
-  return 0;
-}
-
-static int check_if_attached(void)
-{
+  static int initialized;
+  int i;
   int cnt;
-  va_count (cnt);
-  return cnt == 4;
-}
-
-static void trace_entry_info(unsigned __int64 *progxfer)
-{
-  int i;
-  TERM_FAO ("xfer: !XH, imghdr: !XH, ifd: !XH!/",
-            progxfer, progxfer + 1, progxfer + 2);
-  for (i = -2; i < 8; i++)
-    TERM_FAO ("  at !2SW: !XH!/", i, progxfer[i]);
-}
-
-static unsigned __int64 find_entry_point(unsigned __int64 *progxfer)
-{
-  int i;
-  unsigned __int64 entry = 0;
-  
-  for (i = 0; progxfer[i]; i++)
-    entry = progxfer[i];
-  
-  if (trace_entry)
-    {
-      if (entry == 0)
-        term_puts ("No entry point\n");
-      else
-        TERM_FAO ("Entry: !XH!/", entry);
-    }
-  
-  return entry;
-}
-
-static void print_image_type(unsigned char act_code)
-{
-  switch (act_code)
-    {
-    case IMCB$K_MAIN_PROGRAM:
-      term_puts ("prog");
-      break;
-    case IMCB$K_MERGED_IMAGE:
-      term_puts ("mrge");
-      break;
-    case IMCB$K_GLOBAL_IMAGE_SECTION:
-      term_puts ("glob");
-      break;
-    default:
-      term_puts ("????");
-    }
-}
-
-static void print_segment_flags(unsigned int flags)
-{
-  term_puts ("   ");
-  term_putc (flags & FLAG_READ ? 'R' : '-');
-  term_putc (flags & FLAG_WRITE ? 'W' : '-');
-  term_putc (flags & FLAG_EXEC ? 'X' : '-');
-  term_puts (flags & FLAG_PROT ? " Prot" : "     ");
-  term_puts (flags & FLAG_SHORT ? " Shrt" : "     ");
-  term_puts (flags & FLAG_SHARED ? " Shrd" : "     ");
-}
-
-static void trace_image_segments(LDRIMG *ldrimg)
-{
-  unsigned int j;
-  LDRISD *ldrisd;
-  
-  if ((long) ldrimg < 0 || trace_images < TRACE_SEGMENT_FLAGS)
-    return;
-  
-  ldrisd = ldrimg->ldrimg$l_segments;
-  for (j = 0; j < ldrimg->ldrimg$l_segcount; j++)
-    {
-      print_segment_flags(ldrisd[j].ldrisd$i_flags);
-      TERM_FAO (" !XA-!XA!/",
-                ldrisd[j].ldrisd$p_base,
-                (unsigned __int64) ldrisd[j].ldrisd$p_base 
-                + ldrisd[j].ldrisd$i_len - 1);
-    }
-  
-  ldrisd = ldrimg->ldrimg$l_dyn_seg;
-  if (ldrisd)
-    TERM_FAO ("   dynamic            !XA-!XA!/",
-              ldrisd->ldrisd$p_base,
-              (unsigned __int64) ldrisd->ldrisd$p_base 
-              + ldrisd->ldrisd$i_len - 1);
-}
-
-static void trace_single_image(IMCB *imcb)
-{
-  TERM_FAO ("!XA-!XA ",
-            imcb->imcb$l_starting_address,
-            imcb->imcb$l_end_address);
-  
-  print_image_type(imcb->imcb$b_act_code);
-  
-  TERM_FAO (" !AD !40AC!/",
-            1, "KESU" + (imcb->imcb$b_access_mode & 3),
-            imcb->imcb$t_log_image_name);
-  
-  trace_image_segments(imcb->imcb$l_ldrimg);
-}
-
-static int check_pthread_image(IMCB *imcb)
-{
-  return ots$strcmp_eql (pthread_rtl_desc.dsc$a_pointer,
-                         pthread_rtl_desc.dsc$w_length,
-                         imcb->imcb$t_log_image_name + 1,
-                         imcb->imcb$t_log_image_name[0]);
-}
-
-static int scan_images(void)
-{
+  int is_attached;
   IMCB *imcb;
-  int found_threads = 0;
-  
+  if (initialized)
+    term_puts ("gdbstub: re-entry\n");
+  else
+    initialized = 1;
+
+  /* When attached (through SS$_DEBUG condition), the number of arguments
+     is 4 and PROGXFER is the PC at interruption.  */
+  va_count (cnt);
+  is_attached = cnt == 4;
+
+  term_init ();
+
+  /* Hello banner.  */
+  term_puts ("Hello from gdb stub\n");
+
+  trace_init ();
+
+  if (trace_entry && !is_attached)
+    {
+      TERM_FAO ("xfer: !XH, imghdr: !XH, ifd: !XH!/",
+		progxfer, imghdr, imgfile);
+      for (i = -2; i < 8; i++)
+	TERM_FAO ("  at !2SW: !XH!/", i, progxfer[i]);
+    }
+
+  /* Search for entry point.  */
+  if (!is_attached)
+    {
+      entry_pc = 0;
+      for (i = 0; progxfer[i]; i++)
+	entry_pc = progxfer[i];
+
+      if (trace_entry)
+	{
+	  if (entry_pc == 0)
+	    {
+	      term_puts ("No entry point\n");
+	      return 0;
+	    }
+	  else
+	    TERM_FAO ("Entry: !XH!/",entry_pc);
+	}
+    }
+  else
+    entry_pc = progxfer[0];
+
+  has_threads = 0;
   for (imcb = ctl$gl_imglstptr->imcb$l_flink;
        imcb != ctl$gl_imglstptr;
        imcb = imcb->imcb$l_flink)
     {
-      if (check_pthread_image(imcb))
-        found_threads = 1;
-      
+      if (ots$strcmp_eql (pthread_rtl_desc.dsc$a_pointer,
+			  pthread_rtl_desc.dsc$w_length,
+			  imcb->imcb$t_log_image_name + 1,
+			  imcb->imcb$t_log_image_name[0]))
+	has_threads = 1;
+			  
       if (trace_images)
-        trace_single_image(imcb);
-    }
-  
-  return found_threads;
-}
+	{
+	  unsigned int j;
+	  LDRIMG *ldrimg = imcb->imcb$l_ldrimg;
+	  LDRISD *ldrisd;
 
-static void setup_exception_handler(void)
-{
-  unsigned int status;
-  status = sys$setexv (0, excp_handler, PSL$C_USER, (__void_ptr32) &prevhnd);
-  if (!(status & STS$M_SUCCESS))
-    LIB$SIGNAL (status);
-}
+	  TERM_FAO ("!XA-!XA ",
+		    imcb->imcb$l_starting_address,
+		    imcb->imcb$l_end_address);
 
-static int handle_breakpoint_setup_error(unsigned int status)
-{
-  if ((status & STS$M_COND_ID) == (SS$_NOT_PROCESS_VA & STS$M_COND_ID))
-    {
-      entry_pc = 0;
-      term_puts ("gdbstub: cannot set breakpoint on entry\n");
-      return 1;
-    }
-  else
-    {
-      LIB$SIGNAL (status);
-      return 0;
-    }
-}
+	  switch (imcb->imcb$b_act_code)
+	    {
+	    case IMCB$K_MAIN_PROGRAM:
+	      term_puts ("prog");
+	      break;
+	    case IMCB$K_MERGED_IMAGE:
+	      term_puts ("mrge");
+	      break;
+	    case IMCB$K_GLOBAL_IMAGE_SECTION:
+	      term_puts ("glob");
+	      break;
+	    default:
+	      term_puts ("????");
+	    }
+	  TERM_FAO (" !AD !40AC!/",
+		    1, "KESU" + (imcb->imcb$b_access_mode & 3),
+		    imcb->imcb$t_log_image_name);
 
-static void set_initial_breakpoint(void)
-{
-  static const unsigned char initbp[INITBP_SIZE] =
-    { 0x01, 0x08, 0x00, 0x40, 0x00, 0x00,
-      0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
-      0x00, 0x00, 0x04, 0x00 };
-  unsigned int entry_prot;
-  unsigned int status;
-  
-  status = page_set_rw (entry_pc, INITBP_SIZE, &entry_prot);
-  
-  if (!(status & STS$M_SUCCESS))
-    {
-      handle_breakpoint_setup_error(status);
-      return;
+	  if ((long) ldrimg < 0 || trace_images < 2)
+	    continue;
+	  ldrisd = ldrimg->ldrimg$l_segments;
+	  for (j = 0; j < ldrimg->ldrimg$l_segcount; j++)
+	    {
+	      unsigned int flags = ldrisd[j].ldrisd$i_flags;
+	      term_puts ("   ");
+	      term_putc (flags & 0x04 ? 'R' : '-');
+	      term_putc (flags & 0x02 ? 'W' : '-');
+	      term_putc (flags & 0x01 ? 'X' : '-');
+	      term_puts (flags & 0x01000000 ? " Prot" : "     ");
+	      term_puts (flags & 0x04000000 ? " Shrt" : "     ");
+	      term_puts (flags & 0x08000000 ? " Shrd" : "     ");
+	      TERM_FAO (" !XA-!XA!/",
+			ldrisd[j].ldrisd$p_base,
+			(unsigned __int64) ldrisd[j].ldrisd$p_base 
+			+ ldrisd[j].ldrisd$i_len - 1);
+	    }
+	  ldrisd = ldrimg->ldrimg$l_dyn_seg;
+	  if (ldrisd)
+	    TERM_FAO ("   dynamic            !XA-!XA!/",
+		      ldrisd->ldrisd$p_base,
+		      (unsigned __int64) ldrisd->ldrisd$p_base 
+		      + ldrisd->ldrisd$i_len - 1);
+	}
     }
-  
-  if (entry_pc != 0)
-    {
-      ots$move (entry_saved, INITBP_SIZE, (void *)entry_pc);
-      ots$move ((void *)entry_pc, INITBP_SIZE, (void *)initbp);
-      __fc (entry_pc);
-      page_restore_rw (entry_pc, INITBP_SIZE, entry_prot);
-    }
-}
 
-static void run_gdb_commands(void)
-{
-  while (one_command () == 0)
-    ;
-}
-
-static int
-stub_start (unsigned __int64 *progxfer, void *cli_util,
-            EIHD *imghdr, IFD *imgfile,
-            unsigned int linkflag, unsigned int cliflag)
-{
-  int is_attached;
-  
-  check_reentry();
-  
-  is_attached = check_if_attached();
-  
-  term_init ();
-  print_hello_banner();
-  trace_init ();
-  
-  if (trace_entry && !is_attached)
-    trace_entry_info(progxfer);
-  
-  if (!is_attached)
-    entry_pc = find_entry_point(progxfer);
-  else
-    entry_pc = progxfer[0];
-  
-  has_threads = scan_images();
-  
   if (has_threads)
     threads_init ();
-  
+
+  /* Wait for connection.  */
   sock_init ();
-  setup_exception_handler();
-  
+
+  /* Set primary exception vector.  */
+  {
+    unsigned int status;
+    status = sys$setexv (0, excp_handler, PSL$C_USER, (__void_ptr32) &prevhnd);
+    if (!(status & STS$M_SUCCESS))
+      LIB$SIGNAL (status);
+  }
+
   if (is_attached)
     {
       return excp_handler ((struct chf$signal_array *) progxfer[2],
-                           (struct chf$mech_array *) progxfer[3]);
+			   (struct chf$mech_array *) progxfer[3]);
     }
-  
-  set_initial_breakpoint();
-  
+
+  /* Change first instruction to set a breakpoint.  */
+  {
+    /*
+      01 08 00 40 00 00 	[MII]       break.m 0x80001
+      00 00 00 02 00 00 	            nop.i 0x0
+      00 00 04 00       	            nop.i 0x0;;
+    */
+    static const unsigned char initbp[16] =
+      { 0x01, 0x08, 0x00, 0x40, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+	0x00, 0x00, 0x04, 0x00 };
+    unsigned int entry_prot;
+    unsigned int status;
+    
+    status = page_set_rw (entry_pc, 16, &entry_prot);
+
+    if (!(status & STS$M_SUCCESS))
+      {
+	if ((status & STS$M_COND_ID) == (SS$_NOT_PROCESS_VA & STS$M_COND_ID))
+	  {
+	    /* Cannot write here.  This can happen when pthreads are
+	       used.  */
+	    entry_pc = 0;
+	    term_puts ("gdbstub: cannot set breakpoint on entry\n");
+	  }
+	else
+	  LIB$SIGNAL (status);
+      }
+    
+    if (entry_pc != 0)
+      {
+	ots$move (entry_saved, 16, (void *)entry_pc);
+	ots$move ((void *)entry_pc, 16, (void *)initbp);
+	__fc (entry_pc);
+	page_restore_rw (entry_pc, 16, entry_prot);
+      }
+  }
+
+  /* If it wasn't possible to set a breakpoint on the entry point,
+     accept gdb commands now.  Note that registers are not updated.  */
   if (entry_pc == 0)
-    run_gdb_commands();
-  
+    {
+      while (one_command () == 0)
+	;
+    }
+
+  /* We will see!  */
   return SS$_CONTINUE;
 }
 
